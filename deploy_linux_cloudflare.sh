@@ -47,21 +47,15 @@ if [[ -z "$STREAMLIT_BIN" || ! -x "$STREAMLIT_BIN" ]]; then
   exit 1
 fi
 
-if [[ "$APP_DIR" == *$'\n'* || "$APP_DIR" == *%* ]]; then
-  printf 'The project path cannot contain a newline or percent sign for systemd units.\n' >&2
+if [[ "$APP_DIR" =~ [[:space:]] || "$APP_DIR" == *%* ||
+      "$STREAMLIT_BIN" =~ [[:space:]] || "$SERVICE_HOME" =~ [[:space:]] ]]; then
+  printf 'The project, user home, and Streamlit paths must not contain whitespace or percent signs for systemd units.\n' >&2
   exit 1
 fi
 
-systemd_quote() {
-  local value="$1"
-  value="${value//\\/\\\\}"
-  value="${value//\"/\\\"}"
-  printf '"%s"' "$value"
-}
-
-APP_DIR_UNIT="$(systemd_quote "$APP_DIR")"
-STREAMLIT_BIN_UNIT="$(systemd_quote "$STREAMLIT_BIN")"
-SERVICE_HOME_UNIT="$(systemd_quote "$SERVICE_HOME")"
+APP_DIR_UNIT="$APP_DIR"
+RUN_SCRIPT_UNIT="$APP_DIR/run_linux.sh"
+TUNNEL_SCRIPT_UNIT="$APP_DIR/scripts/cloudflare_quick_tunnel.sh"
 
 install -d -o "$SERVICE_USER" -g "$(id -gn "$SERVICE_USER")" -m 0750 "$DATA_DIR"
 install -d -o "$SERVICE_USER" -g "$(id -gn "$SERVICE_USER")" -m 0750 "$DATA_DIR/backups"
@@ -104,14 +98,14 @@ After=network.target
 [Service]
 Type=simple
 User=$SERVICE_USER
-Environment=HOME=$SERVICE_HOME_UNIT
+Environment=HOME=$SERVICE_HOME
 WorkingDirectory=$APP_DIR_UNIT
 Environment=CCSS_DATA_DIR=$DATA_DIR
 Environment=CCSS_SERVER_ADDRESS=127.0.0.1
 Environment=CCSS_SERVER_PORT=8501
-Environment=STREAMLIT_BIN=$STREAMLIT_BIN_UNIT
+Environment=STREAMLIT_BIN=$STREAMLIT_BIN
 UMask=0077
-ExecStart=/bin/bash $APP_DIR_UNIT/run_linux.sh
+ExecStart=/bin/bash $RUN_SCRIPT_UNIT
 Restart=on-failure
 RestartSec=5
 
@@ -129,12 +123,12 @@ BindsTo=ccss-streamlit.service
 [Service]
 Type=simple
 User=$SERVICE_USER
-Environment=HOME=$SERVICE_HOME_UNIT
+Environment=HOME=$SERVICE_HOME
 WorkingDirectory=$APP_DIR_UNIT
 Environment=CCSS_QUICK_TUNNEL_URL_FILE=$DATA_DIR/cloudflare-url.txt
 Environment=CCSS_QUICK_TUNNEL_ORIGIN=http://127.0.0.1:8501
 UMask=0077
-ExecStart=/bin/bash $APP_DIR_UNIT/scripts/cloudflare_quick_tunnel.sh
+ExecStart=/bin/bash $TUNNEL_SCRIPT_UNIT
 Restart=always
 RestartSec=10
 
