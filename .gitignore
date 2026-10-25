@@ -1,0 +1,14 @@
+.streamlit/secrets.toml
+.env
+.env.*
+!.env.example
+.vercel/
+programs.db
+programs.db-shm
+programs.db-wal
+ccss.db
+ccss.db-shm
+ccss.db-wal
+backups/
+__pycache__/
+.venv/
