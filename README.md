@@ -113,13 +113,13 @@ python -m streamlit run streamlit_app.py
 
 ## Deploy to a Linux server with Streamlit
 
-From the project directory on the Linux server:
+The repository includes `run_linux.sh` for starting the Streamlit app with the already-installed Streamlit command, or the project's `.venv` if present. From the project directory on the Linux server:
 
 ```bash
 python3 -m venv .venv
 .venv/bin/python -m pip install -r requirements-streamlit.txt
-CCSS_DB_PATH=/var/lib/ccss/ccss.db .venv/bin/python -m streamlit run streamlit_app.py \
-  --server.address 0.0.0.0 --server.port 8501
+chmod +x run_linux.sh
+CCSS_DATA_DIR=/var/lib/ccss ./run_linux.sh
 ```
 
 Before startup, create the database directory with administrator privileges and assign it to the same Linux account that will run Streamlit (replace `ccssuser` with that account):
@@ -129,7 +129,24 @@ sudo mkdir -p /var/lib/ccss/backups
 sudo chown -R ccssuser:ccssuser /var/lib/ccss
 ```
 
-Keep that directory on persistent storage. Daily backups are written to `/var/lib/ccss/backups`; set `CCSS_BACKUP_DIR` to choose another persistent location. Copy backups off the server regularly for disaster recovery. If Streamlit runs as a system service, use the service's configured user instead of your interactive login account.
+The script binds to `0.0.0.0:8501` by default. Set `CCSS_SERVER_ADDRESS` or `CCSS_SERVER_PORT` to override these values; extra Streamlit arguments can also be passed after the script name. If Streamlit is installed outside the project's `.venv`, the script uses the `streamlit` command on `PATH`; set `STREAMLIT_BIN` to its full path if needed.
+
+`CCSS_DATA_DIR` puts the SQLite database and daily backups in `/var/lib/ccss`. Alternatively, set `CCSS_DB_PATH` and `CCSS_BACKUP_DIR` separately. Keep these paths on persistent storage, copy backups off the server regularly, and use the service's configured Linux account when running under systemd. For a public deployment, place Streamlit behind a TLS-enabled reverse proxy and restrict direct access to port 8501 with the server firewall.
+
+### Keep Streamlit running and share it with a free Cloudflare URL
+
+For a no-Cloudflare-account setup, Cloudflare Quick Tunnels provide a temporary `trycloudflare.com` URL. They are intended for testing, not production: the hostname changes whenever the tunnel restarts, and Cloudflare does not guarantee uptime. Anyone with the URL can reach the app; CCSS still requires its own account login. The service binds Streamlit to `127.0.0.1`, so the app is not directly exposed on port 8501.
+
+Install `cloudflared` on the Linux server using the [official instructions](https://developers.cloudflare.com/tunnel/downloads/). From the checked-out project directory, install the systemd services:
+
+```bash
+chmod +x deploy_linux_cloudflare.sh run_linux.sh scripts/cloudflare_quick_tunnel.sh
+sudo ./deploy_linux_cloudflare.sh
+```
+
+The installer runs both Streamlit and the tunnel as the Linux account that invoked `sudo`, enables them at boot, and prints the generated public URL. If `/var/lib/ccss/ccss.db` does not exist but the project has an existing `ccss.db`, it makes a consistent SQLite backup copy into the persistent data directory and leaves the source unchanged. It also stores the current URL in `/var/lib/ccss/cloudflare-url.txt`; read it again with `cat /var/lib/ccss/cloudflare-url.txt`. Disconnecting from SSH does not stop the services. Check logs with `sudo journalctl -u ccss-streamlit -u ccss-cloudflare -f`, and stop them with `sudo systemctl disable --now ccss-cloudflare ccss-streamlit`. A restart may generate a different URL.
+
+Quick Tunnel is not a stable production hosting option. For a fixed hostname and dependable availability, use a named Cloudflare Tunnel with a Cloudflare account and a domain, or deploy behind a production reverse proxy.
 
 For a scheduled backup even when nobody is using the website, add a daily cron job (adjust the project path and log path for your server):
 

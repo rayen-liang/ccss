@@ -10,5 +10,6 @@ ccss.db
 ccss.db-shm
 ccss.db-wal
 backups/
+data/
 __pycache__/
 .venv/
