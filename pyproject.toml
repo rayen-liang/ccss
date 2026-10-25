@@ -2,6 +2,12 @@
 name = "ccss-vercel"
 version = "1.0.0"
 requires-python = ">=3.12,<3.14"
+dependencies = [
+    "PyMuPDF>=1.26,<2.0",
+    "fastapi>=0.115,<1.0",
+    "psycopg[binary]>=3.2,<4.0",
+    "itsdangerous>=2.2,<3.0",
+]
 
 [tool.vercel]
 entrypoint = "api.index:app"

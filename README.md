@@ -53,7 +53,7 @@ python -c "import secrets; print(secrets.token_urlsafe(48))"
 
 ### 2. Configure Vercel
 
-Import this Git repository in Vercel with the repository root as the project root. The `[tool.vercel].entrypoint` setting in `pyproject.toml` points Vercel to `api.index:app`, and `public/` contains the static client. Use the **Other** preset if prompted so framework detection does not select an unrelated Python file. Add these environment variables to the Vercel project (Production and any Preview environments that should work):
+Import this Git repository in Vercel with the repository root as the project root. The `[project].dependencies` in `pyproject.toml` declares the Python runtime packages, and `[tool.vercel].entrypoint` points Vercel to `api.index:app`; `public/` contains the static client. Keep the Vercel Root Directory set to `.` so the dependency manifest is included in the build. Use the **Other** preset if prompted so framework detection does not select an unrelated Python file. Add these environment variables to the Vercel project (Production and any Preview environments that should work):
 
 - `DATABASE_URL` — the Supabase PostgreSQL connection string, including SSL.
 - `CCSS_SESSION_SECRET` — the random string generated above; keep it private and at least 32 characters.
