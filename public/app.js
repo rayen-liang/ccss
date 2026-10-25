@@ -27,6 +27,7 @@ function renderAuth(mode = "login") {
   const isForgot = mode === "forgot";
   app.innerHTML = `<main class="auth-wrap"><section class="auth-card">
     <div class="brand">📘 CCSS</div><p class="tagline">Connect, Challenge, Succeed in English</p>
+    ${mode === "login" ? `<p class="muted">教師請使用教師帳號登入；學生請使用學生帳號登入。</p>` : ""}
     ${!isReset && !isForgot ? `<div class="switcher" role="tablist">
       <button data-auth="login" class="${mode === "login" ? "active" : ""}">登入</button>
       <button data-auth="register" class="${isRegister ? "active" : ""}">建立學生帳號</button>

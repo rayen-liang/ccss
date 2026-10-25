@@ -109,6 +109,7 @@ def show_login():
         ["登入", "建立學生帳號", "忘記密碼"]
     )
     with login_tab:
+        st.caption("教師請使用教師帳號登入；學生請使用學生帳號登入。")
         with st.form("login_form"):
             username = st.text_input("帳號")
             password = st.text_input("密碼", type="password")

@@ -15,6 +15,7 @@ DIFFICULTIES = ("初級", "中級","中高級", "高級")
 QUESTION_TYPES = ("choice", "fill_blank", "essay")
 PASSWORD_ITERATIONS = 310_000
 RESET_TOKEN_TTL_MINUTES = 30
+DEFAULT_TEACHER_PASSWORD = "teacheremma123"
 
 
 @contextmanager
@@ -499,15 +500,30 @@ def initialize_database():
                ON audit_logs(created_at DESC)"""
         )
         teacher = conn.execute(
-            "SELECT id FROM users WHERE username = 'teacher' AND role = 'teacher'"
+            """SELECT id, password_hash, must_change_password FROM users
+               WHERE username = 'teacher' AND role = 'teacher'"""
         ).fetchone()
         if teacher is None:
-            initial_password = os.environ.get("CCSS_TEACHER_PASSWORD", "teacher")
+            initial_password = os.environ.get(
+                "CCSS_TEACHER_PASSWORD", DEFAULT_TEACHER_PASSWORD
+            )
+            validate_password(initial_password)
             conn.execute(
                 """INSERT INTO users
                    (username, display_name, password_hash, role, must_change_password)
                    VALUES ('teacher', 'Teacher', ?, 'teacher', 1)""",
                 (hash_password(initial_password),),
+            )
+        elif teacher["must_change_password"] and verify_password(
+            "teacher", teacher["password_hash"]
+        ):
+            initial_password = os.environ.get(
+                "CCSS_TEACHER_PASSWORD", DEFAULT_TEACHER_PASSWORD
+            )
+            validate_password(initial_password)
+            conn.execute(
+                "UPDATE users SET password_hash = ? WHERE id = ?",
+                (hash_password(initial_password), teacher["id"]),
             )
 
 

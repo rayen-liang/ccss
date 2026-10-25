@@ -8,7 +8,7 @@ The interface uses an 18 px base font size.
 
 - Student registration requires a unique email for password recovery. Passwords are stored as salted PBKDF2 hashes; successful and failed login attempts are recorded.
 - Students can change their display name and password, inspect account details and recent login history, and reset forgotten passwords with single-use, 30-minute email links.
-- Initial teacher login: `teacher` / `teacher`. The teacher must change this password on first login. Set `CCSS_TEACHER_PASSWORD` before first startup to choose a different initial password; the first-login change is still required.
+- Teacher login uses the shared login form with username `teacher` and default password `teacheremma123`. The teacher must change this password on first login. Set `CCSS_TEACHER_PASSWORD` before first startup or database setup to choose a different initial password; the first-login change is still required.
 - The student practice page is named "練習題". Multiple-choice and fill-in-the-blank questions are automatically scored; essays are graded by a teacher. Completed questions are hidden from general practice, while teacher assignments continue to follow their own retake settings. Students can build a random practice set by category, difficulty, and question count. Each set is saved as a single-use quiz; submitting it again cannot create duplicate scores.
 - Once a quiz is submitted, its answers are locked and cannot be edited. The result and history views show scores, correctness, the student's submitted selections, and available explanations without displaying editable answer fields. Correct answers and explanations are hidden when a teacher disables answer review for an assignment. Essay scores and feedback appear after teacher grading. Personal test history and recent results are retained.
 - The leaderboard totals each student's best score for each question and ranks only by total score; students with equal scores share the same rank. Automatically graded multiple-choice and fill-in-the-blank attempts are used to calculate student answer accuracy. The student home page shows current score, rank, answer accuracy, teacher-assigned homework and due dates, latest teacher announcements, recent quiz scores, and a centered leaderboard.
@@ -59,10 +59,10 @@ Import this Git repository in Vercel with the repository root as the project roo
 - `CCSS_SESSION_SECRET` — the random string generated above; keep it private and at least 32 characters.
 - `CCSS_COOKIE_SECURE` — `true` (or leave unset) for the HTTPS site.
 - `CCSS_PUBLIC_URL` — the deployed HTTPS URL, used in password-reset emails.
-- `CCSS_TEACHER_PASSWORD` — set before first database setup if creating a fresh database.
+- `CCSS_TEACHER_PASSWORD` — optional override for the initial teacher password; defaults to `teacheremma123`.
 - `CCSS_SMTP_HOST`, `CCSS_SMTP_PORT`, `CCSS_SMTP_FROM`, `CCSS_SMTP_USER`, `CCSS_SMTP_PASSWORD` — mail service settings for forgotten-password links.
 
-Deploy the project and verify `https://YOUR-DOMAIN/api/health` returns `{"status":"ok"}`. The initial teacher account is `teacher`; when created from a fresh database it must change its initial password at first login. Students can register from the login page.
+Deploy the project and verify `https://YOUR-DOMAIN/api/health` returns `{"status":"ok"}`. Teachers and students use the shared login page; the initial teacher account is `teacher` / `teacheremma123` unless `CCSS_TEACHER_PASSWORD` is set. The teacher must change the initial password at first login. When the setup script encounters a legacy teacher account still awaiting its first password change with the old default password, it updates it to the configured initial password. Existing teacher passwords that have already been changed are preserved. Students can register from the login page.
 
 ### Vercel version scope
 
@@ -97,7 +97,7 @@ sudo apt install -y tesseract-ocr tesseract-ocr-eng
 
 The Python dependencies for PDF rendering and OCR are listed in `requirements.txt`. Set `CCSS_TESSERACT_LANG=eng+chi_tra` and install the corresponding Traditional Chinese Tesseract language data if those PDFs need Chinese text recognition.
 
-The teacher starts with the `teacher` / `teacher` account and must change the initial password before using the teacher workspace. Update both `streamlit_app.py` and `ccss_db.py` together when deploying application updates, then restart Streamlit. If startup reports that `ccss_db` has no `daily_backup`, verify the module path with `python -c "import ccss_db; print(ccss_db.__file__); print(hasattr(ccss_db, 'daily_backup'))"`; the server may be loading an older or different copy of the module. The app displays a warning and continues without a startup backup when the loaded module lacks that function.
+The teacher signs in through the shared login form with username `teacher` and default password `teacheremma123`, and must change the initial password before using the teacher workspace. A legacy teacher account that still has the old default password and is awaiting its first password change is migrated on startup; a password already changed by the teacher is preserved. Set `CCSS_TEACHER_PASSWORD` before the first application startup to choose a different initial password. Update both `streamlit_app.py` and `ccss_db.py` together when deploying application updates, then restart Streamlit. If startup reports that `ccss_db` has no `daily_backup`, verify the module path with `python -c "import ccss_db; print(ccss_db.__file__); print(hasattr(ccss_db, 'daily_backup'))"`; the server may be loading an older or different copy of the module. The app displays a warning and continues without a startup backup when the loaded module lacks that function.
 
 ## Run locally
 
@@ -148,7 +148,7 @@ CCSS_SMTP_USER=ccss@example.edu
 CCSS_SMTP_PASSWORD=replace-with-a-secret
 ```
 
-Port `587` uses STARTTLS; port `465` uses implicit TLS. Keep credentials in the server's secret manager or protected service environment, never in Git. The reset link is single-use and expires after 30 minutes. For a public deployment, put Streamlit behind HTTPS using a reverse proxy, firewall the Streamlit port, and protect server access. Set `CCSS_TEACHER_PASSWORD` before the first application startup if you do not want to use the initial `teacher` password. Do not commit secrets or the production database.
+Port `587` uses STARTTLS; port `465` uses implicit TLS. Keep credentials in the server's secret manager or protected service environment, never in Git. The reset link is single-use and expires after 30 minutes. For a public deployment, put Streamlit behind HTTPS using a reverse proxy, firewall the Streamlit port, and protect server access. Set `CCSS_TEACHER_PASSWORD` before the first application startup if you do not want to use the initial `teacheremma123` password. Do not commit secrets or the production database.
 
 ## Tests
 

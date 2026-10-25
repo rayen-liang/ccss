@@ -1,5 +1,6 @@
 import argparse
 import hashlib
+import hmac
 import json
 import os
 import sqlite3
@@ -11,6 +12,26 @@ from psycopg.types.json import Jsonb
 
 
 ROOT = Path(__file__).resolve().parents[1]
+DEFAULT_TEACHER_PASSWORD = "teacheremma123"
+
+
+def hash_password(password):
+    salt = os.urandom(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310_000)
+    return f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
+
+
+def verify_password(password, encoded):
+    try:
+        algorithm, iterations, salt_hex, digest_hex = encoded.split("$")
+        if algorithm != "pbkdf2_sha256":
+            return False
+        digest = hashlib.pbkdf2_hmac(
+            "sha256", password.encode(), bytes.fromhex(salt_hex), int(iterations)
+        )
+        return hmac.compare_digest(digest.hex(), digest_hex)
+    except (ValueError, TypeError):
+        return False
 
 
 def source_rows(connection, table):
@@ -289,22 +310,32 @@ def main():
         conn.execute(schema, prepare=False)
         imported = import_legacy_data(conn, args.sqlite) if args.sqlite else {}
         teacher = conn.execute(
-            "SELECT id FROM users WHERE LOWER(username) = 'teacher' AND role = 'teacher'"
+            """SELECT id, password_hash, must_change_password FROM users
+               WHERE LOWER(username) = 'teacher' AND role = 'teacher'"""
         ).fetchone()
         if not teacher:
-            password = os.environ.get("CCSS_TEACHER_PASSWORD", "teacher")
+            password = os.environ.get(
+                "CCSS_TEACHER_PASSWORD", DEFAULT_TEACHER_PASSWORD
+            )
             if len(password) < 8:
                 raise SystemExit("CCSS_TEACHER_PASSWORD must be at least 8 characters.")
-            salt = os.urandom(16)
-            digest = hashlib.pbkdf2_hmac(
-                "sha256", password.encode(), salt, 310_000
-            )
-            encoded = f"pbkdf2_sha256$310000${salt.hex()}${digest.hex()}"
             conn.execute(
                 """INSERT INTO users(username, display_name, password_hash, role,
                                       must_change_password)
                    VALUES ('teacher', 'Teacher', %s, 'teacher', TRUE)""",
-                (encoded,),
+                (hash_password(password),),
+            )
+        elif teacher["must_change_password"] and verify_password(
+            "teacher", teacher["password_hash"]
+        ):
+            password = os.environ.get(
+                "CCSS_TEACHER_PASSWORD", DEFAULT_TEACHER_PASSWORD
+            )
+            if len(password) < 8:
+                raise SystemExit("CCSS_TEACHER_PASSWORD must be at least 8 characters.")
+            conn.execute(
+                "UPDATE users SET password_hash = %s WHERE id = %s",
+                (hash_password(password), teacher["id"]),
             )
         identity_tables = (
             "users", "classes", "question_banks", "import_batches", "questions",

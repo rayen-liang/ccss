@@ -5,6 +5,7 @@ from unittest.mock import patch
 from fastapi import HTTPException
 
 from api import index
+from scripts import setup_supabase
 
 
 class VercelApiTests(unittest.TestCase):
@@ -12,6 +13,12 @@ class VercelApiTests(unittest.TestCase):
         encoded = index._hash_password("a-long-test-password")
         self.assertTrue(index._verify_password("a-long-test-password", encoded))
         self.assertFalse(index._verify_password("wrong-password", encoded))
+
+    def test_supabase_teacher_password_hash_round_trip(self):
+        self.assertEqual(setup_supabase.DEFAULT_TEACHER_PASSWORD, "teacheremma123")
+        encoded = setup_supabase.hash_password("teacheremma123")
+        self.assertTrue(setup_supabase.verify_password("teacheremma123", encoded))
+        self.assertFalse(setup_supabase.verify_password("teacher", encoded))
 
     def test_question_import_maps_exam_json(self):
         question = index._validate_question(

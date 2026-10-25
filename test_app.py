@@ -5,6 +5,7 @@ import tempfile
 import unittest
 from datetime import date, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
 import ccss_db as db
 
@@ -14,11 +15,12 @@ class CcssDatabaseTests(unittest.TestCase):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.previous_db_path = db.DB_PATH
         db.DB_PATH = Path(self.temp_dir.name) / "test.db"
-        db.initialize_database()
+        with patch.dict(os.environ, {}, clear=True):
+            db.initialize_database()
         self.student_id = db.register_student(
             "alice", "correct-horse", "alice@example.com"
         )
-        self.teacher_id = db.authenticate("teacher", "teacher")["id"]
+        self.teacher_id = db.authenticate("teacher", "teacheremma123")["id"]
         self.other_student_id = db.register_student(
             "bob", "another-password", "bob@example.com"
         )
@@ -45,11 +47,35 @@ class CcssDatabaseTests(unittest.TestCase):
         return db.add_question(self.teacher_id, question)
 
     def test_teacher_bootstrap_requires_password_change(self):
-        teacher = db.authenticate("teacher", "teacher")
+        teacher = db.login("teacher", "teacheremma123")
         self.assertIsNotNone(teacher)
         self.assertEqual(teacher["role"], "teacher")
         self.assertEqual(teacher["must_change_password"], 1)
-        self.assertIsNone(db.authenticate("teacher", "wrong"))
+        self.assertIsNone(db.authenticate("teacher", "teacher"))
+
+    def test_legacy_default_teacher_password_is_migrated_once(self):
+        with db.database() as conn:
+            conn.execute(
+                "UPDATE users SET password_hash = ?, must_change_password = 1 WHERE id = ?",
+                (db.hash_password("teacher"), self.teacher_id),
+            )
+
+        with patch.dict(os.environ, {}, clear=True):
+            db.initialize_database()
+
+        teacher = db.authenticate("teacher", "teacheremma123")
+        self.assertIsNotNone(teacher)
+        self.assertEqual(teacher["must_change_password"], 1)
+        self.assertIsNone(db.authenticate("teacher", "teacher"))
+
+    def test_teacher_login_does_not_overwrite_changed_password(self):
+        db.change_password(self.teacher_id, "a-custom-teacher-password")
+
+        with patch.dict(os.environ, {}, clear=True):
+            db.initialize_database()
+
+        self.assertIsNotNone(db.authenticate("teacher", "a-custom-teacher-password"))
+        self.assertIsNone(db.authenticate("teacher", "teacheremma123"))
 
     def test_teacher_can_create_class_and_assign_selected_students(self):
         class_id = db.create_class(self.teacher_id, "Grade 7A")
@@ -240,7 +266,7 @@ class CcssDatabaseTests(unittest.TestCase):
         self.assertEqual(first_login["daily_reward"]["streak_day"], 1)
         second_login = db.login("alice", "correct-horse")
         self.assertIsNone(second_login["daily_reward"])
-        teacher_login = db.login("teacher", "teacher")
+        teacher_login = db.login("teacher", "teacheremma123")
         self.assertIsNone(teacher_login.get("daily_reward"))
         self.assertIsNone(db.login("alice", "incorrect"))
 
