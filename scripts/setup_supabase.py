@@ -34,6 +34,21 @@ def verify_password(password, encoded):
         return False
 
 
+def migrate_existing_users(conn):
+    exists = conn.execute(
+        "SELECT to_regclass('public.users') AS users"
+    ).fetchone()["users"]
+    if not exists:
+        return
+    conn.execute(
+        """ALTER TABLE users
+           ADD COLUMN IF NOT EXISTS email TEXT NOT NULL DEFAULT '',
+           ADD COLUMN IF NOT EXISTS must_change_password BOOLEAN NOT NULL DEFAULT FALSE,
+           ADD COLUMN IF NOT EXISTS is_active BOOLEAN NOT NULL DEFAULT TRUE,
+           ADD COLUMN IF NOT EXISTS created_at TIMESTAMPTZ NOT NULL DEFAULT CURRENT_TIMESTAMP"""
+    )
+
+
 def source_rows(connection, table):
     try:
         return [dict(row) for row in connection.execute(f'SELECT * FROM "{table}"')]
@@ -307,6 +322,7 @@ def main():
 
     schema = (ROOT / "api" / "schema.sql").read_text(encoding="utf-8")
     with psycopg.connect(database_url, connect_timeout=10, row_factory=dict_row) as conn:
+        migrate_existing_users(conn)
         conn.execute(schema, prepare=False)
         imported = import_legacy_data(conn, args.sqlite) if args.sqlite else {}
         teacher = conn.execute(

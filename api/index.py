@@ -242,8 +242,29 @@ def _leaderboard_rows(conn):
 
 @app.get("/api/health")
 def health():
-    with database() as conn:
-        conn.execute("SELECT 1")
+    try:
+        with database() as conn:
+            missing_tables = conn.execute(
+                """SELECT name FROM unnest(ARRAY[
+                       'users', 'login_events', 'daily_login_rewards'
+                   ]) AS required(name)
+                   WHERE to_regclass('public.' || name) IS NULL"""
+            ).fetchall()
+            if missing_tables:
+                names = ", ".join(row["name"] for row in missing_tables)
+                raise HTTPException(
+                    status_code=503,
+                    detail=f"資料庫尚未完成初始化，缺少必要資料表：{names}。請執行 scripts/setup_supabase.py。",
+                )
+            conn.execute(
+                "SELECT email, must_change_password, is_active FROM users LIMIT 0"
+            )
+    except psycopg.Error as exc:
+        logger.exception("Database schema check failed")
+        raise HTTPException(
+            status_code=503,
+            detail="資料庫結構尚未更新，請管理員重新執行 scripts/setup_supabase.py。",
+        ) from exc
     return {"status": "ok"}
 
 
@@ -254,6 +275,8 @@ def register(payload: dict[str, Any], response: Response):
     email = str(payload.get("email", "")).strip().casefold()
     if not 3 <= len(username) <= 32 or re.search(r"\s", username):
         raise HTTPException(status_code=400, detail="帳號需為 3 至 32 字元且不可有空白。")
+    if payload.get("confirm") is not None and password != str(payload["confirm"]):
+        raise HTTPException(status_code=400, detail="兩次輸入的密碼不一致。")
     _validate_password(password)
     if not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email) or len(email) > 254:
         raise HTTPException(status_code=400, detail="請輸入有效的電子郵件地址。")
@@ -269,6 +292,12 @@ def register(payload: dict[str, Any], response: Response):
                 reward = _daily_reward(conn, user["id"])
     except psycopg.errors.UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="帳號或電子郵件已被使用。") from exc
+    except psycopg.Error as exc:
+        logger.exception("Student registration failed")
+        raise HTTPException(
+            status_code=503,
+            detail="資料庫尚未完成初始化或結構更新，請管理員重新執行 scripts/setup_supabase.py。",
+        ) from exc
     response.set_cookie(
         COOKIE_NAME,
         _serializer().dumps({"user_id": user["id"]}),
@@ -285,24 +314,35 @@ def register(payload: dict[str, Any], response: Response):
 def login(payload: dict[str, Any], response: Response):
     username = str(payload.get("username", "")).strip()
     password = str(payload.get("password", ""))
+    if not username or len(username) > 32 or re.search(r"\s", username):
+        raise HTTPException(status_code=400, detail="請輸入有效的登入帳號。")
+    if not password or len(password) > 1024:
+        raise HTTPException(status_code=400, detail="請輸入有效的密碼。")
     reward = None
     succeeded = False
-    with database() as conn:
-        with conn.transaction():
-            user = conn.execute(
-                "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)",
-                (username,),
-            ).fetchone()
-            succeeded = bool(
-                user and user["is_active"] and _verify_password(password, user["password_hash"])
-            )
-            conn.execute(
-                """INSERT INTO login_events(user_id, username, succeeded)
-                   VALUES (%s, %s, %s)""",
-                (user["id"] if user else None, username[:32], succeeded),
-            )
-            if succeeded:
-                reward = _daily_reward(conn, user["id"]) if user["role"] == "student" else None
+    try:
+        with database() as conn:
+            with conn.transaction():
+                user = conn.execute(
+                    "SELECT * FROM users WHERE LOWER(username) = LOWER(%s)",
+                    (username,),
+                ).fetchone()
+                succeeded = bool(
+                    user and user["is_active"] and _verify_password(password, user["password_hash"])
+                )
+                conn.execute(
+                    """INSERT INTO login_events(user_id, username, succeeded)
+                       VALUES (%s, %s, %s)""",
+                    (user["id"] if user else None, username[:32], succeeded),
+                )
+                if succeeded:
+                    reward = _daily_reward(conn, user["id"]) if user["role"] == "student" else None
+    except psycopg.Error as exc:
+        logger.exception("Authentication database operation failed")
+        raise HTTPException(
+            status_code=503,
+            detail="登入服務的資料庫尚未初始化或結構過舊，請管理員執行 scripts/setup_supabase.py；若仍失敗，請檢查 Vercel Function logs。",
+        ) from exc
     if not succeeded:
         raise HTTPException(status_code=401, detail="帳號或密碼錯誤。")
     response.set_cookie(

@@ -31,7 +31,9 @@ async function api(path, options = {}) {
     throw new Error(
       typeof detail === "string" ? detail
         : Array.isArray(detail?.errors) ? detail.errors.join("\n")
-          : detail?.message || `請求失敗（${response.status}）`
+          : detail?.message || (response.status >= 500
+            ? `伺服器暫時無法處理要求（${response.status}）。若登入或建立帳號持續失敗，請管理員檢查 Vercel Function logs 與 /api/health。`
+            : `請求失敗（${response.status}）`)
     );
   }
   return result;
@@ -51,10 +53,10 @@ function renderAuth(mode = "login") {
     ${showNotice()}
     <form class="auth-pane" data-form="${mode}">
       ${isRegister ? `<label>電子郵件<input name="email" type="email" required autocomplete="email"></label>` : ""}
-      ${mode === "login" || isRegister ? `<label>帳號<input name="username" required minlength="3" maxlength="32" autocomplete="username"></label>` : ""}
+      ${mode === "login" || isRegister ? `<label>帳號<input name="username" required ${isRegister ? "minlength=\"3\"" : ""} maxlength="32" autocomplete="username"></label>` : ""}
       ${isForgot ? `<label>註冊電子郵件<input name="email" type="email" required autocomplete="email"></label>` : ""}
       ${isReset ? `<input name="token" type="hidden" value="${esc(new URLSearchParams(location.search).get("reset"))}"><label>新密碼<input name="password" type="password" required minlength="8" autocomplete="new-password"></label><label>確認新密碼<input name="confirm" type="password" required minlength="8"></label>` : ""}
-      ${mode === "login" || isRegister ? `<label>密碼<input name="password" type="password" required minlength="8" autocomplete="${mode === "login" ? "current-password" : "new-password"}"></label>` : ""}
+      ${mode === "login" || isRegister ? `<label>密碼<input name="password" type="password" required ${isRegister ? "minlength=\"8\"" : ""} maxlength="1024" autocomplete="${mode === "login" ? "current-password" : "new-password"}"></label>` : ""}
       ${isRegister ? `<label>確認密碼<input name="confirm" type="password" required minlength="8" autocomplete="new-password"></label>` : ""}
       <button class="primary">${mode === "login" ? "登入" : isRegister ? "建立帳號並登入" : isForgot ? "寄送重設連結" : "重設密碼"}</button>
       ${mode === "login" ? `<button type="button" class="secondary" data-auth="forgot">忘記密碼</button>` : ""}

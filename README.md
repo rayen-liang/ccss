@@ -1,7 +1,7 @@
 # CCSS — English Learning Platform 
 
 CCSS is a Streamlit and SQLite learning site with separate student and teacher workflows. Students can practise categorized English questions, review their scores on the leaderboard, and share notes. Teachers can manage practice assignments, create or import question banks, and grade essays.
-a
+
 The interface uses an 18 px base font size.
 
 ## Features
@@ -43,7 +43,7 @@ $env:CCSS_TEACHER_PASSWORD = "use-a-strong-initial-password"
 python scripts\setup_supabase.py --sqlite ccss.db
 ```
 
-The source SQLite database is only read and is not modified. Without `--sqlite`, the setup command creates a fresh database. If importing, run the setup once against an empty Supabase database. Password-reset tokens and in-progress quiz sessions are intentionally not migrated; learners should request new reset links and begin new quizzes after the move. Imported account password hashes are retained.
+The source SQLite database is only read and is not modified. Without `--sqlite`, the setup command creates a fresh database or applies idempotent schema updates to an existing Supabase database. If importing, run the setup once against an empty Supabase database; do not repeat `--sqlite` against a populated database. To update an existing deployment's schema without re-importing data, run the setup command again without `--sqlite`. Password-reset tokens and in-progress quiz sessions are intentionally not migrated; learners should request new reset links and begin new quizzes after the move. Imported account password hashes are retained.
 
 Generate a separate signing key for sessions:
 

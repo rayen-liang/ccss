@@ -2,8 +2,11 @@ import os
 import io
 import unittest
 import zipfile
-from unittest.mock import patch
+from contextlib import nullcontext
+from datetime import datetime, timezone
+from unittest.mock import MagicMock, patch
 
+import psycopg
 from fastapi import HTTPException
 
 from api import index
@@ -142,6 +145,90 @@ class VercelApiTests(unittest.TestCase):
                 with index.database():
                     pass
         self.assertEqual(error.exception.status_code, 503)
+
+    def test_login_rejects_empty_credentials_without_database_access(self):
+        with patch.object(index, "database") as database:
+            for credentials in ({}, {"username": "teacher"}, {"password": "secret"}):
+                with self.subTest(credentials=credentials):
+                    with self.assertRaises(HTTPException) as error:
+                        index.login(credentials, index.Response())
+                    self.assertEqual(error.exception.status_code, 400)
+            database.assert_not_called()
+
+    def test_registration_rejects_mismatched_confirmation_without_database(self):
+        with patch.object(index, "database") as database:
+            with self.assertRaises(HTTPException) as error:
+                index.register(
+                    {
+                        "username": "student",
+                        "password": "a-long-password",
+                        "confirm": "different-password",
+                        "email": "student@example.com",
+                    },
+                    index.Response(),
+                )
+        self.assertEqual(error.exception.status_code, 400)
+        self.assertIn("不一致", error.exception.detail)
+        database.assert_not_called()
+
+    def test_existing_short_password_can_still_log_in(self):
+        user = {
+            "id": 1,
+            "username": "legacy",
+            "display_name": "Legacy",
+            "role": "teacher",
+            "email": "",
+            "must_change_password": True,
+            "created_at": datetime.now(timezone.utc),
+            "is_active": True,
+            "password_hash": index._hash_password("short"),
+        }
+        connection = MagicMock()
+        connection.execute.side_effect = [
+            MagicMock(fetchone=MagicMock(return_value=user)),
+            MagicMock(),
+        ]
+        response = index.Response()
+        with (
+            patch.object(index, "database", return_value=nullcontext(connection)),
+            patch.dict(os.environ, {"CCSS_SESSION_SECRET": "x" * 32, "CCSS_COOKIE_SECURE": "false"}),
+        ):
+            result = index.login(
+                {"username": "legacy", "password": "short"}, response
+            )
+        self.assertEqual(result["user"]["username"], "legacy")
+        self.assertIn("ccss_session=", response.headers["set-cookie"])
+
+    def test_login_reports_schema_errors_as_setup_guidance_not_500(self):
+        with patch.object(
+            index, "database", side_effect=psycopg.errors.UndefinedColumn("email")
+        ):
+            with self.assertRaises(HTTPException) as error:
+                index.login(
+                    {"username": "teacher", "password": "password"},
+                    index.Response(),
+                )
+        self.assertEqual(error.exception.status_code, 503)
+        self.assertIn("setup_supabase.py", error.exception.detail)
+
+    def test_existing_user_migration_adds_email_before_schema_setup(self):
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"users": "users"}
+
+        setup_supabase.migrate_existing_users(connection)
+
+        migration_sql = connection.execute.call_args.args[0]
+        self.assertIn("ADD COLUMN IF NOT EXISTS email", migration_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS must_change_password", migration_sql)
+        self.assertIn("ADD COLUMN IF NOT EXISTS is_active", migration_sql)
+
+    def test_new_database_skips_existing_user_migration(self):
+        connection = MagicMock()
+        connection.execute.return_value.fetchone.return_value = {"users": None}
+
+        setup_supabase.migrate_existing_users(connection)
+
+        connection.execute.assert_called_once()
 
 
 if __name__ == "__main__":
