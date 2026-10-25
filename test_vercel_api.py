@@ -1,5 +1,7 @@
 import os
+import io
 import unittest
+import zipfile
 from unittest.mock import patch
 
 from fastapi import HTTPException
@@ -19,6 +21,50 @@ class VercelApiTests(unittest.TestCase):
         encoded = setup_supabase.hash_password("teacheremma123")
         self.assertTrue(setup_supabase.verify_password("teacheremma123", encoded))
         self.assertFalse(setup_supabase.verify_password("teacher", encoded))
+
+    def test_csv_question_import_matches_streamlit_field_format(self):
+        content = (
+            "category,scope,grade_level,difficulty,type,prompt,options,answer,"
+            "accepted_answers,explanation,rubric,min_word_count,points\n"
+            "Grammar,Present simple,Grade 7,初級,choice,Choose the correct form.,"
+            "go|goes,goes,,Third-person singular.,,,5\n"
+        ).encode()
+        payload = index._parse_question_import_file("questions.csv", content)
+        validated, _, _ = index._prepare_question_import(payload)
+        self.assertEqual(validated[0]["scope"], "Present simple")
+        self.assertEqual(validated[0]["grade_level"], "Grade 7")
+        self.assertEqual(validated[0]["options"], ["go", "goes"])
+        self.assertEqual(validated[0]["answer"], "goes")
+
+    def test_xlsx_question_import_reads_shared_strings_and_inline_values(self):
+        namespace = "http://schemas.openxmlformats.org/spreadsheetml/2006/main"
+        content = io.BytesIO()
+        with zipfile.ZipFile(content, "w") as archive:
+            archive.writestr(
+                "xl/sharedStrings.xml",
+                f'<sst xmlns="{namespace}"><si><t>category</t></si>'
+                "<si><t>difficulty</t></si><si><t>type</t></si>"
+                "<si><t>prompt</t></si><si><t>options</t></si>"
+                "<si><t>answer</t></si><si><t>Grammar</t></si>"
+                "<si><t>初級</t></si><si><t>choice</t></si>"
+                "<si><t>Choose.</t></si><si><t>A|B</t></si><si><t>A</t></si></sst>",
+            )
+            archive.writestr(
+                "xl/worksheets/sheet1.xml",
+                f'<worksheet xmlns="{namespace}"><sheetData>'
+                '<row r="1"><c r="A1" t="s"><v>0</v></c><c r="B1" t="s"><v>1</v></c>'
+                '<c r="C1" t="s"><v>2</v></c><c r="D1" t="s"><v>3</v></c>'
+                '<c r="E1" t="s"><v>4</v></c><c r="F1" t="s"><v>5</v></c></row>'
+                '<row r="2"><c r="A2" t="s"><v>6</v></c><c r="B2" t="s"><v>7</v></c>'
+                '<c r="C2" t="s"><v>8</v></c><c r="D2" t="s"><v>9</v></c>'
+                '<c r="E2" t="s"><v>10</v></c><c r="F2" t="s"><v>11</v></c></row>'
+                "</sheetData></worksheet>",
+            )
+        payload = index._parse_question_import_file("questions.xlsx", content.getvalue())
+        validated, _, _ = index._prepare_question_import(payload)
+        self.assertEqual(validated[0]["prompt"], "Choose.")
+        self.assertEqual(validated[0]["options"], ["A", "B"])
+        self.assertEqual(validated[0]["answer"], "A")
 
     def test_question_import_maps_exam_json(self):
         question = index._validate_question(

@@ -1,11 +1,20 @@
 const app = document.querySelector("#app");
-const state = { user: null, page: "首頁", activeQuiz: null, notice: "", noticeType: "", wheelRequest: null };
+const state = {
+  user: null, page: "首頁", activeQuiz: null, notice: "", noticeType: "",
+  wheelRequest: null, studentSearch: "", selectedStudent: null, selectedClass: null,
+  selectedBank: null, importPreview: null, assignmentReport: null,
+};
 const studentPages = ["首頁", "練習題", "我的作答", "作文中心", "便利貼", "帳號設定"];
 const teacherPages = ["學生管理", "題庫管理", "作業指派", "作文批改", "公告與檢舉", "操作紀錄", "帳號設定"];
 const esc = (value) => String(value ?? "").replace(/[&<>"']/g, (char) => ({
   "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
 }[char]));
 const displayDate = (value) => value ? new Date(value).toLocaleString() : "—";
+const dateTimeInput = (value) => {
+  if (!value) return "";
+  const date = new Date(value);
+  return Number.isNaN(date.valueOf()) ? "" : new Date(date.getTime() - date.getTimezoneOffset() * 60000).toISOString().slice(0, 16);
+};
 const notice = (text, type = "") => { state.notice = text; state.noticeType = type; };
 const showNotice = () => state.notice ? `<div class="notice ${state.noticeType}">${esc(state.notice)}</div>` : "";
 
@@ -17,7 +26,14 @@ async function api(path, options = {}) {
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const result = await response.json().catch(() => ({}));
-  if (!response.ok) throw new Error(result.detail || `請求失敗（${response.status}）`);
+  if (!response.ok) {
+    const detail = result.detail;
+    throw new Error(
+      typeof detail === "string" ? detail
+        : Array.isArray(detail?.errors) ? detail.errors.join("\n")
+          : detail?.message || `請求失敗（${response.status}）`
+    );
+  }
   return result;
 }
 
@@ -119,6 +135,7 @@ async function renderStudentPage() {
     const [questions, assignments] = await Promise.all([api("/questions"), api("/student/assignments")]);
     const categories = [...new Set(questions.map(q => q.category))];
     const dueAssignments = assignments.filter(a => !a.submitted_count || a.allow_retake);
+    const now = Date.now();
     return `<div class="grid two">
       ${card(`<h2>開始新練習</h2><form class="stack" data-form="start-practice">
         <label>題目類別<select name="category"><option value="">全部類別</option>${categories.map(x => `<option>${esc(x)}</option>`).join("")}</select></label>
@@ -126,7 +143,15 @@ async function renderStudentPage() {
         <label>題數<select name="count">${[5,10,15,20].map(x => `<option value="${x}" ${x===10?"selected":""}>${x} 題</option>`).join("")}</select></label>
         <button class="primary">抽取題目</button><small class="muted">可練習新題目：${questions.length} 題</small>
       </form>`)}
-      ${card(`<h2>教師指派作業</h2>${dueAssignments.length ? dueAssignments.map(item => `<article class="question"><h3>${esc(item.title)}</h3><p>${esc(item.description || "教師指派練習")}</p><small class="muted">${item.question_count} 題 · 截止 ${displayDate(item.due_at)}</small><div style="margin-top:.7rem"><button class="primary" data-assignment="${item.id}">開始作答</button></div></article>`).join("") : `<div class="empty">目前沒有待完成作業</div>`}`)}
+      ${card(`<h2>教師指派作業</h2>${dueAssignments.length ? dueAssignments.map(item => {
+        const available = item.status === "published"
+          && (!item.starts_at || new Date(item.starts_at).getTime() <= now)
+          && (!item.due_at || new Date(item.due_at).getTime() >= now);
+        const status = item.status !== "published" ? "尚未發布或已關閉"
+          : item.starts_at && new Date(item.starts_at).getTime() > now ? "尚未開始"
+            : item.due_at && new Date(item.due_at).getTime() < now ? "已截止" : "";
+        return `<article class="question"><h3>${esc(item.title)}</h3><p>${esc(item.description || "教師指派練習")}</p><small class="muted">${item.question_count} 題 · 開始 ${displayDate(item.starts_at)} · 截止 ${displayDate(item.due_at)}${item.time_limit_minutes ? ` · 限時 ${item.time_limit_minutes} 分鐘` : ""}</small>${status ? `<p class="muted">${status}</p>` : ""}<div style="margin-top:.7rem"><button class="primary" data-assignment="${item.id}" ${available ? "" : "disabled"}>開始作答</button></div></article>`;
+      }).join("") : `<div class="empty">目前沒有待完成作業</div>`}`)}
     </div>`;
   }
   if (state.page === "我的作答") {
@@ -177,22 +202,84 @@ async function accountPage() {
 async function renderTeacherPage() {
   if (state.page === "帳號設定") return accountPage();
   if (state.page === "學生管理") {
-    const [students, classes] = await Promise.all([api("/teacher/students"), api("/teacher/classes")]);
-    return `<div class="grid two">${card(`<h2>學生帳號與成績</h2>${table(["帳號", "暱稱", "積分", "正確率", "狀態", "管理"], students.map(s=>[esc(s.username),esc(s.display_name),s.score,`${s.accuracy}%`,s.is_active?"啟用":"停用",`<button class="secondary" data-reset-student="${s.id}">重設密碼</button> <button class="secondary" data-status-student="${s.id}" data-active="${!s.is_active}">${s.is_active?"停用":"啟用"}</button>`]))}<div class="divider"></div><h3>建立學生帳號</h3><form class="stack" data-form="create-student"><label>帳號<input name="username" required minlength="3"></label><label>暱稱<input name="display_name"></label><label>電子郵件<input name="email" type="email"></label><label>初始密碼（至少 8 字元）<input name="password" type="password" minlength="8" required></label><button class="primary">建立帳號</button></form>`)}
-      ${card(`<h2>建立班級</h2><form class="stack" data-form="create-class"><label>班級名稱<input name="name" required maxlength="80"></label><p>勾選加入的學生：</p>${studentSelection(students)}<button class="primary">建立班級</button></form><div class="divider"></div><h3>現有班級</h3>${table(["班級","學生數"],classes.map(c=>[esc(c.name),c.student_count]))}`)}</div>`;
+    const [students, classes] = await Promise.all([
+      api(`/teacher/students?search=${encodeURIComponent(state.studentSearch)}`),
+      api("/teacher/classes"),
+    ]);
+    const roster = state.selectedClass ? await api("/teacher/students") : students;
+    const selectedStudent = students.find(item => item.id === state.selectedStudent);
+    const selectedClass = classes.find(item => item.id === state.selectedClass);
+    const studentDetail = selectedStudent
+      ? await api(`/teacher/students/${selectedStudent.id}`)
+      : null;
+    return `<div class="stack">
+      ${card(`<h2>學生帳號與成績</h2>
+        <form class="row" data-form="search-students"><input name="search" value="${esc(state.studentSearch)}" placeholder="搜尋帳號、暱稱或電子郵件"><button class="secondary">搜尋</button></form>
+        ${table(["帳號","暱稱","積分","正確率","排名","狀態","管理"],students.map(s=>[esc(s.username),esc(s.display_name),s.score,s.accuracy == null ? "—" : `${Number(s.accuracy).toFixed(1)}%`,s.rank ? `#${s.rank}` : "—",s.is_active?"啟用":"停用",`<button class="secondary" data-edit-student="${s.id}">資料／成績</button> <button class="secondary" data-reset-student="${s.id}">重設密碼</button> <button class="secondary" data-status-student="${s.id}" data-active="${!s.is_active}">${s.is_active?"停用":"啟用"}</button>`]))}
+        ${studentDetail ? `<div class="divider"></div><h3>${esc(studentDetail.username)} 的個人資料與學習紀錄</h3><div class="grid metrics">${card(`<span class="muted">累積積分</span><div class="metric">${studentDetail.score}</div>`)}${card(`<span class="muted">排行榜</span><div class="metric">${studentDetail.rank ? `#${studentDetail.rank}` : "—"}</div>`)}${card(`<span class="muted">答題正確率</span><div class="metric">${studentDetail.accuracy == null ? "—" : `${studentDetail.accuracy.toFixed(1)}%`}</div>`)}</div><p>班級：${esc((studentDetail.classes||[]).join("、")||"未加入班級")} · 帳號：${studentDetail.is_active?"啟用":"停用"}</p><form class="stack" data-form="update-student" data-student="${studentDetail.id}"><label>暱稱<input name="display_name" value="${esc(studentDetail.display_name)}" maxlength="40" required></label><label>電子郵件<input name="email" type="email" value="${esc(studentDetail.email || "")}"></label><button class="primary">儲存資料</button></form><h4>最近作答</h4>${table(["題目","類別","學生答案","分數","時間"],studentDetail.attempts.slice(0,20).map(a=>[esc(a.prompt),esc(a.category),esc(a.response),a.earned_points==null?"待批改":`${a.earned_points}/${a.points}`,displayDate(a.submitted_at)]))}<h4>最近登入</h4>${table(["結果","時間"],studentDetail.login_history.map(row=>[row.succeeded?"成功":"失敗",displayDate(row.created_at)]))}` : ""}
+        <div class="divider"></div><h3>建立學生帳號</h3><form class="stack" data-form="create-student"><label>帳號<input name="username" required minlength="3"></label><label>暱稱<input name="display_name"></label><label>電子郵件<input name="email" type="email"></label><label>初始密碼（至少 8 字元）<input name="password" type="password" minlength="8" required></label><button class="primary">建立帳號</button></form>`)}
+      <div class="grid two">
+        ${card(`<h2>${selectedClass ? "編輯班級" : "建立班級"}</h2><form class="stack" data-form="${selectedClass ? "update-class" : "create-class"}" ${selectedClass ? `data-class="${selectedClass.id}"` : ""}><label>班級名稱<input name="name" required maxlength="80" value="${esc(selectedClass?.name || "")}"></label><p>勾選加入的學生：</p><div class="inline-checks">${roster.map(student=>`<label><input type="checkbox" name="student_ids" value="${student.id}" ${selectedClass?.student_ids?.includes(student.id) ? "checked" : ""} ${student.is_active ? "" : "disabled"}>${esc(student.display_name)} (@${esc(student.username)})</label>`).join("")}</div><button class="primary">${selectedClass ? "儲存班級與成員" : "建立班級"}</button>${selectedClass ? `<button class="secondary" type="button" data-cancel-class>取消編輯</button>` : ""}</form>`)}
+        ${card(`<h2>現有班級</h2>${table(["班級","學生數","管理"],classes.map(c=>[esc(c.name),c.student_count,`<button class="secondary" data-edit-class="${c.id}">編輯班級／成員</button>`]))}`)}
+      </div>
+    </div>`;
   }
   if (state.page === "題庫管理") {
-    const [questions, banks] = await Promise.all([api("/teacher/questions"), api("/teacher/banks")]);
+    const [questions, banks] = await Promise.all([
+      api(`/teacher/questions?search=${encodeURIComponent(state.questionSearch || "")}`),
+      api("/teacher/banks"),
+    ]);
+    const selectedBank = banks.find(bank => bank.id === state.selectedBank);
     return `<div class="grid two">
-      ${card(`<h2>新增／編輯單題</h2><form class="stack" data-form="add-question"><label>類別<input name="category" required value="Grammar"></label><label>難度<select name="difficulty">${["初級","中級","中高級","高級"].map(x=>`<option>${x}</option>`).join("")}</select></label><label>題目類型<select name="type"><option value="choice">單選題</option><option value="fill_blank">填空題</option><option value="essay">作文</option></select></label><label>題目<textarea name="prompt" required></textarea></label><label>選項（以 | 分隔）<input name="options"></label><label>正確答案<input name="answer"></label><label>填空接受答案（以 | 分隔）<input name="accepted_answers"></label><label>配分<input name="points" type="number" min="1" value="5"></label><label>作文最低字數<input name="min_word_count" type="number" min="0" value="0"></label><label>作文評分規準<textarea name="rubric"></textarea></label><label>解析<textarea name="explanation"></textarea></label><label class="inline-checks"><span><input name="is_published" type="checkbox" checked> 立即發布</span></label><button class="primary">新增至題庫</button></form>`)}
-      ${card(`<h2>匯入考卷 JSON</h2><p class="muted">支援題庫格式或含 title/category/level/questions 的考卷格式。</p><form class="stack" data-form="import-json"><input name="file" type="file" accept=".json,application/json"><label>或貼上 JSON<textarea name="json" placeholder='{"title":"English Test","questions":[...]}'></textarea></label><button class="primary">驗證並匯入</button></form><div class="divider"></div><h3>PDF 文字擷取</h3><p class="muted">支援 20 頁、3 MB 以內的文字型 PDF。掃描影像請先用 OCR 轉成文字，再手動檢查和編題。</p><form class="stack" data-form="pdf-read"><input name="pdf" type="file" accept="application/pdf" required><button class="secondary">擷取 PDF 文字</button><textarea name="extracted" placeholder="抽取結果會顯示在此，可複製到題目編輯器校對。"></textarea></form><div class="divider"></div><h3>題庫列表</h3>${table(["題庫","題數"],banks.map(b=>[esc(b.name),b.question_count]))}`)}
-      ${card(`<h2>現有題目（${questions.length}）</h2>${table(["類別","難度","題型","題目","配分","管理"],questions.map(q=>[esc(q.category),esc(q.difficulty),esc(q.question_type),esc(q.prompt),q.points,`<button class="secondary" data-edit-question="${q.id}">編輯</button> <button class="danger-button" data-archive-question="${q.id}">${q.is_published?"下架":"已下架"}</button>`]))}`)}
+      ${card(`<h2>新增／編輯單題</h2><form class="stack" data-form="add-question">
+        <label>題庫<select name="bank_id"><option value="">未分類</option>${banks.map(bank=>`<option value="${bank.id}">${esc(bank.name)}</option>`).join("")}</select></label>
+        <label>類別<input name="category" required value="Grammar"></label><label>範圍／知識點<input name="scope"></label><label>年級／程度<input name="grade_level"></label>
+        <label>難度<select name="difficulty">${["初級","中級","中高級","高級"].map(x=>`<option>${x}</option>`).join("")}</select></label><label>題目類型<select name="type"><option value="choice">單選題</option><option value="fill_blank">填空題</option><option value="essay">作文</option></select></label>
+        <label>題目<textarea name="prompt" required></textarea></label><label>選項（以 | 分隔）<input name="options"></label><label>正確答案<input name="answer"></label><label>填空接受答案（以 | 分隔）<input name="accepted_answers"></label>
+        <label>配分<input name="points" type="number" min="1" value="5"></label><label>作文最低字數<input name="min_word_count" type="number" min="0" value="0"></label><label>作文評分規準<textarea name="rubric"></textarea></label><label>解析<textarea name="explanation"></textarea></label>
+        <label class="inline-checks"><span><input name="is_published" type="checkbox" checked> 立即發布</span></label><button class="primary">新增至題庫</button></form>
+        <div class="divider"></div><h3>題庫管理</h3><form class="stack" data-form="${selectedBank ? "update-bank" : "create-bank"}" ${selectedBank ? `data-bank="${selectedBank.id}"` : ""}><label>題庫名稱<input name="name" required maxlength="100" value="${esc(selectedBank?.name || "")}"></label><label>題庫說明<textarea name="description" maxlength="2000">${esc(selectedBank?.description || "")}</textarea></label><button class="secondary">${selectedBank ? "儲存題庫" : "建立題庫"}</button>${selectedBank ? `<button type="button" class="danger-button" data-delete-bank="${selectedBank.id}" ${selectedBank.question_count ? "disabled" : ""}>刪除空題庫</button><button type="button" class="secondary" data-cancel-bank>取消</button>` : ""}</form>
+        ${table(["題庫","說明","題數","管理"],banks.map(bank=>[esc(bank.name),esc(bank.description),bank.question_count,`<button class="secondary" data-edit-bank="${bank.id}">編輯</button>`]))}`)}
+      ${card(`<h2>匯入題目</h2><p class="muted">支援 JSON、CSV、XLSX；UTF-8 CSV/XLSX 欄位格式與 Streamlit 版一致。匯入前會驗證並預覽。</p>
+        <form class="stack" data-form="import-file"><label>匯入至題庫<select name="bank_id"><option value="">自動選擇／不指定</option>${banks.map(bank=>`<option value="${bank.id}">${esc(bank.name)}</option>`).join("")}</select></label>
+        <input name="file" type="file" accept=".json,.csv,.xlsx,application/json,text/csv,application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" required><button class="primary">驗證並預覽</button></form><div id="import-preview"></div>
+        <div class="divider"></div><h3>PDF 文字擷取</h3><p class="muted">支援 20 頁、3 MB 以內的文字型 PDF。掃描影像需先以 OCR 辨識，Vercel 版不在 serverless 函式內執行 OCR。</p>
+        <form class="stack" data-form="pdf-read"><input name="pdf" type="file" accept="application/pdf" required><button class="secondary">擷取 PDF 文字</button><textarea name="extracted" placeholder="抽取結果會顯示在此，可複製到題目編輯器校對。"></textarea></form>`)}
+      ${card(`<h2>題目搜尋與預覽（${questions.length}）</h2><form class="row" data-form="search-questions"><input name="search" value="${esc(state.questionSearch || "")}" placeholder="搜尋題幹或類別"><button class="secondary">搜尋</button></form>
+        ${table(["類別","範圍","年級","題庫","難度","題型","題目","配分","狀態","管理"],questions.map(q=>[esc(q.category),esc(q.scope),esc(q.grade_level),esc(banks.find(b=>b.id===q.bank_id)?.name || "未分類"),esc(q.difficulty),esc(q.question_type),`<details><summary>${esc(q.prompt.slice(0,80))}</summary><p>${esc(q.prompt)}</p><p>選項：${esc((q.options||[]).join("、")||"—")}</p><p>答案：${esc(q.answer || (q.accepted_answers||[]).join(" / "))}</p><p>${esc(q.explanation)}</p></details>`,q.points,q.is_published?"已發布":"草稿",`<button class="secondary" data-edit-question="${q.id}">編輯</button> <button class="danger-button" data-archive-question="${q.id}">${q.is_published?"下架":"已下架"}</button>`]))}`)}
     </div>`;
   }
   if (state.page === "作業指派") {
-    const [students, questions, assignments] = await Promise.all([api("/teacher/students"), api("/teacher/questions"), api("/teacher/assignments")]);
-    return `<div class="grid two">${card(`<h2>建立作業</h2><form class="stack" data-form="create-assignment"><label>作業名稱<input name="title" required></label><label>說明<textarea name="description"></textarea></label><label>截止時間<input name="due_at" type="datetime-local"></label><label>作答時間（分鐘，0 為不限）<input name="time_limit_minutes" type="number" min="0" value="0"></label><p>選擇題目</p><div class="inline-checks">${questions.map(q=>`<label><input type="checkbox" name="question_ids" value="${q.id}">${esc(q.prompt.slice(0,80))}</label>`).join("")}</div><p>指派給學生</p>${studentSelection(students)}<div class="inline-checks"><label><input type="checkbox" name="show_answers" checked>交卷後顯示正解與解析</label><label><input type="checkbox" name="allow_retake">允許重做</label></div><button class="primary">發布作業</button></form>`)}
-    ${card(`<h2>已發布作業</h2>${table(["名稱","學生","已提交","截止日期"],assignments.map(a=>[esc(a.title),a.student_count,a.submitted_students,displayDate(a.due_at)]))}`)}</div>`;
+    const [students, questions, assignments] = await Promise.all([
+      api("/teacher/students"), api("/teacher/questions"), api("/teacher/assignments"),
+    ]);
+    const selectedAssignment = assignments.find(item => item.id === state.assignmentReport);
+    let report = "";
+    if (selectedAssignment) {
+      const [statistics, submissions] = await Promise.all([
+        api(`/teacher/assignments/${selectedAssignment.id}/statistics`),
+        api(`/teacher/assignments/${selectedAssignment.id}/submissions`),
+      ]);
+      const studentId = state.assignmentStudent;
+      const attempts = studentId ? await api(`/teacher/assignments/${selectedAssignment.id}/students/${studentId}/attempts`) : [];
+      const student = submissions.find(item => item.student_id === studentId);
+      report = `<section class="card"><div class="spread"><div><h2>${esc(selectedAssignment.title)} · 成績檢視</h2><p>已提交 ${statistics.submission_count} 人 · 平均 ${statistics.average_score == null ? "—" : statistics.average_score.toFixed(1)} · 最高 ${statistics.highest_score ?? "—"} · 最低 ${statistics.lowest_score ?? "—"}</p></div><button class="secondary" data-export-assignment="${selectedAssignment.id}">匯出成績 CSV</button></div>
+        <h3>逐題統計</h3>${table(["題目","作答人數","答對人數","答對率"],statistics.questions.map(q=>[esc(q.prompt),q.response_count,q.correct_rate == null ? "—" : q.correct_count, q.correct_rate == null ? "—" : `${(q.correct_rate*100).toFixed(1)}%`]))}
+        <h3>學生提交</h3>${table(["學生","帳號","作答題數","成績","提交時間","查看"],submissions.map(s=>[esc(s.display_name),esc(s.username),s.answered_count,`${s.score}/${s.max_score}`,displayDate(s.submitted_at),`<button class="secondary" data-assignment-student="${s.student_id}" data-assignment="${selectedAssignment.id}">逐題作答／改分</button>`]))}
+        ${student ? `<div class="divider"></div><h3>${esc(student.display_name)} 的逐題作答與評分</h3>${attempts.map(item=>`<article class="question"><h4>${esc(item.prompt)} · ${item.earned_points ?? "待批改"}/${item.points}</h4><p>學生答案：${esc(item.response || "尚未作答")}</p>${item.question_type!=="essay" && item.response ? `<p>正確答案：${esc(item.answer || (item.accepted_answers||[]).join(" / "))}</p>` : ""}${item.attempt_id ? `<form class="row" data-form="adjust-score" data-attempt="${item.attempt_id}"><label>調整分數<input name="score" type="number" min="0" max="${item.points}" value="${item.earned_points ?? 0}" required></label><label>調整原因<input name="reason" maxlength="500" required></label><button class="secondary">儲存評分調整</button></form>` : ""}</article>`).join("")}` : ""}</section>`;
+    }
+    return `<div class="stack">
+      <div class="grid two">${card(`<h2>建立作業</h2><form class="stack" data-form="create-assignment">
+        <label>作業名稱<input name="title" required></label><label>說明<textarea name="description"></textarea></label>
+        <label>開始時間（留空表示立即開始）<input name="starts_at" type="datetime-local"></label><label>截止時間<input name="due_at" type="datetime-local"></label>
+        <label>作答時間（分鐘，0 為不限）<input name="time_limit_minutes" type="number" min="0" value="0"></label>
+        <p>選擇題目</p><div class="inline-checks">${questions.map(q=>`<label><input type="checkbox" name="question_ids" value="${q.id}">${esc(q.prompt.slice(0,80))}</label>`).join("")}</div>
+        <p>指派給學生</p>${studentSelection(students)}<div class="inline-checks"><label><input type="checkbox" name="show_answers" checked>交卷後顯示正解與解析</label><label><input type="checkbox" name="allow_retake">允許重做</label></div>
+        <label>建立狀態<select name="status"><option value="published">立即發布</option><option value="draft">儲存草稿</option></select></label><button class="primary">建立作業</button></form>`)}
+      ${card(`<h2>作業列表與管理</h2>${table(["名稱","狀態","學生","題目","已提交","平均比例","開始","截止","管理"],assignments.map(a=>[esc(a.title),esc(a.status),a.student_count,a.question_count,a.submitted_students,a.average_ratio == null ? "—" : `${(a.average_ratio*100).toFixed(1)}%`,displayDate(a.starts_at),displayDate(a.due_at),`<button class="secondary" data-edit-assignment="${a.id}">期限／狀態</button> <button class="secondary" data-assignment-report="${a.id}">檢視成績</button>`]))}
+        ${selectedAssignment ? `<div class="divider"></div><h3>調整「${esc(selectedAssignment.title)}」</h3><form class="stack" data-form="update-assignment-schedule" data-assignment="${selectedAssignment.id}"><label>開始時間<input name="starts_at" type="datetime-local" value="${dateTimeInput(selectedAssignment.starts_at)}"></label><label>截止時間<input name="due_at" type="datetime-local" value="${dateTimeInput(selectedAssignment.due_at)}"></label><button class="primary">儲存期限</button></form><form class="row" data-form="update-assignment-status" data-assignment="${selectedAssignment.id}"><label>作業狀態<select name="status">${["draft","published","closed"].map(status=>`<option value="${status}" ${selectedAssignment.status===status?"selected":""}>${status==="draft"?"草稿":status==="published"?"已發布":"已關閉"}</option>`).join("")}</select></label><button class="secondary">儲存狀態</button></form>` : ""}`)}</div>
+      ${report}
+    </div>`;
   }
   if (state.page === "作文批改") {
     const essays = await api("/teacher/essays");
@@ -212,6 +299,14 @@ async function renderTeacherPage() {
 
 function values(form) { return Object.fromEntries(new FormData(form).entries()); }
 function checked(form, name) { return [...form.querySelectorAll(`input[name="${name}"]:checked`)].map(el=>el.value); }
+async function fileBase64(file) {
+  const bytes = new Uint8Array(await file.arrayBuffer());
+  let binary = "";
+  for (let offset = 0; offset < bytes.length; offset += 0x8000) {
+    binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
+  }
+  return btoa(binary);
+}
 async function handleSubmit(event) {
   const form = event.target.closest("form[data-form]");
   if (!form) return;
@@ -238,17 +333,42 @@ async function handleSubmit(event) {
       history.replaceState(null, "", "/");
       notice("密碼已重設，請使用新密碼登入。", "success"); renderAuth("login"); return;
     }
+    if (type === "search-students") {
+      state.studentSearch = data.search.trim();
+      state.selectedStudent = null;
+      await renderPage();
+      return;
+    }
+    if (type === "search-questions") {
+      state.questionSearch = data.search.trim();
+      await renderPage();
+      return;
+    }
     if (type === "pdf-read") {
       const file = form.querySelector('[name="pdf"]').files[0];
       if (!file || file.size > 3_000_000) throw new Error("PDF 檔案上限為 3 MB。");
-      const bytes = new Uint8Array(await file.arrayBuffer());
-      let binary = "";
-      for (let offset = 0; offset < bytes.length; offset += 0x8000) {
-        binary += String.fromCharCode(...bytes.subarray(offset, offset + 0x8000));
-      }
-      const extracted = await api("/teacher/pdf-text", { method: "POST", body: { content_base64: btoa(binary) } });
+      const extracted = await api("/teacher/pdf-text", { method: "POST", body: { content_base64: await fileBase64(file) } });
       form.querySelector('[name="extracted"]').value = extracted.text;
       notice(`PDF 文字已擷取（${extracted.characters} 字元），請人工校對後出題。`, "success");
+      return;
+    }
+    if (type === "import-file") {
+      const file = form.querySelector('[name="file"]').files[0];
+      if (!file || file.size > 2_000_000) throw new Error("題目匯入檔案上限為 2 MB。");
+      const result = await api("/teacher/questions/import-preview", {
+        method: "POST",
+        body: {
+          filename: file.name,
+          content_base64: await fileBase64(file),
+          bank_id: data.bank_id ? Number(data.bank_id) : null,
+        },
+      });
+      state.importPreview = result.payload;
+      const target = document.querySelector("#import-preview");
+      if (target) target.innerHTML = `<div class="notice success">驗證成功，共 ${result.questions.length} 題。請確認預覽後再匯入。</div>
+        ${table(["類別","範圍","年級","難度","題型","題目","配分"],result.questions.map(q=>[esc(q.category),esc(q.scope),esc(q.grade_level),esc(q.difficulty),esc(q.type),esc(q.prompt),q.points]))}
+        <button class="primary" data-action="confirm-import">確認匯入</button>`;
+      notice("題目驗證通過，請檢查預覽。", "success");
       return;
     }
     if (type === "start-practice") {
@@ -281,16 +401,17 @@ async function handleSubmit(event) {
     } else if (type === "submit-essay") {
       if (!confirm("提交後將不能自行修改，確定提交作文嗎？")) return;
       await api(`/student/essays/${form.dataset.question}/submit`, { method: "POST", body: { content: data.content, assignment_id: form.dataset.assignment ? Number(form.dataset.assignment) : null } }); notice("作文已提交，提交後不能自行修改。", "success");
-    } else if (type === "create-class") {
-      await api("/teacher/classes", { method: "POST", body: { name: data.name, student_ids: checked(form, "student_ids") } }); notice("班級已建立。", "success");
     } else if (type === "create-student") {
       await api("/teacher/students", { method: "POST", body: data }); notice("學生帳號已建立，首次登入需修改密碼。", "success");
+    } else if (type === "update-student") {
+      await api(`/teacher/students/${form.dataset.student}`, { method: "PATCH", body: data });
+      state.selectedStudent = null; notice("學生資料已更新。", "success");
     } else if (type === "add-question") {
       const raw = {
         ...data,
+        bank_id: data.bank_id ? Number(data.bank_id) : null,
         points: Number(data.points),
         min_word_count: Number(data.min_word_count || 0),
-        bank_id: form.dataset.bankId ? Number(form.dataset.bankId) : null,
         is_published: Boolean(form.querySelector('[name="is_published"]:checked')),
         options: data.options ? data.options.split("|").map(x=>x.trim()).filter(Boolean) : [],
         accepted_answers: data.accepted_answers ? data.accepted_answers.split("|").map(x=>x.trim()).filter(Boolean) : [],
@@ -302,22 +423,47 @@ async function handleSubmit(event) {
       } else {
         await api("/teacher/questions", { method: "POST", body: raw }); notice("題目已新增。", "success");
       }
-    } else if (type === "import-json") {
-      let parsed;
-      if (data.file) {
-        const file = form.querySelector('[name="file"]').files[0];
-        if (!file || file.size > 2_000_000) throw new Error("JSON 檔案上限為 2 MB。");
-        parsed = JSON.parse(await file.text());
-      } else parsed = JSON.parse(data.json);
-      const imported = await api("/teacher/questions/import", { method: "POST", body: parsed });
-      notice(`已成功匯入 ${imported.imported} 題。`, "success");
     } else if (type === "create-assignment") {
       await api("/teacher/assignments", { method: "POST", body: {
-        title: data.title, description: data.description, due_at: data.due_at || null,
+        title: data.title, description: data.description,
+        starts_at: data.starts_at || null, due_at: data.due_at || null,
         time_limit_minutes: Number(data.time_limit_minutes), show_answers: Boolean(form.querySelector('[name="show_answers"]:checked')),
         allow_retake: Boolean(form.querySelector('[name="allow_retake"]:checked')),
+        status: data.status,
         question_ids: checked(form, "question_ids"), student_ids: checked(form, "student_ids"),
       } }); notice("作業已發布。", "success");
+    } else if (type === "create-class" || type === "update-class") {
+      const body = { name: data.name, student_ids: checked(form, "student_ids").map(Number) };
+      if (type === "create-class") {
+        await api("/teacher/classes", { method: "POST", body });
+      } else {
+        await api(`/teacher/classes/${form.dataset.class}`, { method: "PATCH", body });
+        state.selectedClass = null;
+      }
+      notice("班級與成員已儲存。", "success");
+    } else if (type === "create-bank" || type === "update-bank") {
+      if (type === "create-bank") {
+        await api("/teacher/banks", { method: "POST", body: data });
+      } else {
+        await api(`/teacher/banks/${form.dataset.bank}`, { method: "PATCH", body: data });
+        state.selectedBank = null;
+      }
+      notice("題庫已儲存。", "success");
+    } else if (type === "update-assignment-schedule") {
+      await api(`/teacher/assignments/${form.dataset.assignment}/schedule`, {
+        method: "PATCH", body: { starts_at: data.starts_at || null, due_at: data.due_at || null },
+      });
+      notice("作業期限已更新。", "success");
+    } else if (type === "update-assignment-status") {
+      await api(`/teacher/assignments/${form.dataset.assignment}/status`, {
+        method: "PATCH", body: { status: data.status },
+      });
+      notice("作業狀態已更新。", "success");
+    } else if (type === "adjust-score") {
+      await api(`/teacher/attempts/${form.dataset.attempt}/adjust-score`, {
+        method: "POST", body: { score: Number(data.score), reason: data.reason },
+      });
+      notice("評分已更新並記錄操作原因。", "success");
     } else if (type === "grade-essay") {
       const comments = data.quoted_text && data.comment ? [{ quoted_text: data.quoted_text, comment: data.comment }] : [];
       await api(`/teacher/essays/${form.dataset.attempt}/grade`, { method: "POST", body: { score: Number(data.score), feedback: data.feedback, comments } });
@@ -363,6 +509,16 @@ app.addEventListener("click", async event => {
     }
     if (action === "practice-done") { state.activeQuiz = null; renderPage(); return; }
     if (action === "refresh") { renderPage(); return; }
+    if (action === "confirm-import") {
+      if (!state.importPreview) throw new Error("找不到已驗證的匯入預覽，請重新選擇檔案。");
+      const result = await api("/teacher/questions/import", {
+        method: "POST", body: state.importPreview,
+      });
+      state.importPreview = null;
+      notice(`已成功匯入 ${result.imported} 題。`, "success");
+      renderPage();
+      return;
+    }
     if (action === "wheel") {
       const id = crypto.randomUUID() + crypto.randomUUID();
       const reward = await api("/student/wheel", { method: "POST", body: { request_id: id } });
@@ -421,6 +577,80 @@ app.addEventListener("click", async event => {
       await api(`/teacher/students/${statusStudent.dataset.statusStudent}/status`, { method: "POST", body: { active } });
       notice(active ? "學生帳號已啟用。" : "學生帳號已停用。", "success"); renderPage(); return;
     }
+    const editStudent = event.target.closest("[data-edit-student]")?.dataset.editStudent;
+    if (editStudent) {
+      state.selectedStudent = Number(editStudent);
+      await renderPage();
+      return;
+    }
+    const editClass = event.target.closest("[data-edit-class]")?.dataset.editClass;
+    if (editClass) {
+      state.selectedClass = Number(editClass);
+      await renderPage();
+      return;
+    }
+    if (event.target.closest("[data-cancel-class]")) {
+      state.selectedClass = null;
+      await renderPage();
+      return;
+    }
+    const editBank = event.target.closest("[data-edit-bank]")?.dataset.editBank;
+    if (editBank) {
+      state.selectedBank = Number(editBank);
+      await renderPage();
+      return;
+    }
+    if (event.target.closest("[data-cancel-bank]")) {
+      state.selectedBank = null;
+      await renderPage();
+      return;
+    }
+    const deleteBank = event.target.closest("[data-delete-bank]")?.dataset.deleteBank;
+    if (deleteBank && confirm("確定刪除此空題庫？")) {
+      await api(`/teacher/banks/${deleteBank}`, { method: "DELETE" });
+      state.selectedBank = null;
+      notice("題庫已刪除。", "success");
+      renderPage();
+      return;
+    }
+    const editAssignment = event.target.closest("[data-edit-assignment]")?.dataset.editAssignment;
+    if (editAssignment) {
+      state.assignmentReport = Number(editAssignment);
+      state.assignmentStudent = null;
+      await renderPage();
+      return;
+    }
+    const assignmentReport = event.target.closest("[data-assignment-report]")?.dataset.assignmentReport;
+    if (assignmentReport) {
+      state.assignmentReport = Number(assignmentReport);
+      state.assignmentStudent = null;
+      await renderPage();
+      return;
+    }
+    const assignmentStudent = event.target.closest("[data-assignment-student]");
+    if (assignmentStudent) {
+      state.assignmentReport = Number(assignmentStudent.dataset.assignment);
+      state.assignmentStudent = Number(assignmentStudent.dataset.assignmentStudent);
+      await renderPage();
+      return;
+    }
+    const exportAssignment = event.target.closest("[data-export-assignment]")?.dataset.exportAssignment;
+    if (exportAssignment) {
+      const response = await fetch(`/api/teacher/assignments/${exportAssignment}/scores.csv`, {
+        credentials: "same-origin",
+      });
+      if (!response.ok) {
+        const result = await response.json().catch(() => ({}));
+        throw new Error(result.detail || `匯出失敗（${response.status}）`);
+      }
+      const url = URL.createObjectURL(await response.blob());
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = `ccss-assignment-${exportAssignment}-scores.csv`;
+      link.click();
+      URL.revokeObjectURL(url);
+      return;
+    }
     const archiveQuestion = event.target.closest("[data-archive-question]")?.dataset.archiveQuestion;
     if (archiveQuestion && confirm("確定下架此題目？下架後學生無法再看到。")) {
       await api(`/teacher/questions/${archiveQuestion}`, { method: "DELETE" });
@@ -435,6 +665,8 @@ app.addEventListener("click", async event => {
       form.dataset.editId = question.id;
       form.dataset.bankId = question.bank_id || "";
       form.elements.category.value = question.category;
+      form.elements.scope.value = question.scope || "";
+      form.elements.grade_level.value = question.grade_level || "";
       form.elements.difficulty.value = question.difficulty;
       form.elements.type.value = question.question_type;
       form.elements.prompt.value = question.prompt;
@@ -446,6 +678,7 @@ app.addEventListener("click", async event => {
       form.elements.rubric.value = question.rubric || "";
       form.elements.explanation.value = question.explanation || "";
       form.elements.is_published.checked = question.is_published;
+      form.elements.bank_id.value = question.bank_id || "";
       form.querySelector("button.primary").textContent = "儲存題目修改";
       form.scrollIntoView({ behavior: "smooth", block: "center" });
       return;

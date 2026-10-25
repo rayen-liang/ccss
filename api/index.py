@@ -1,11 +1,15 @@
 import hashlib
 import hmac
+import csv
+import io
 import json
 import logging
 import os
 import re
 import secrets
 import smtplib
+import zipfile
+import xml.etree.ElementTree as ET
 from base64 import b64decode
 from binascii import Error as Base64Error
 from contextlib import contextmanager
@@ -1003,20 +1007,84 @@ def report_note(note_id: int, payload: dict[str, Any], user=Depends(_require_rea
 @app.get("/api/teacher/students", dependencies=[Depends(_require_teacher)])
 def teacher_students(search: str = ""):
     with database() as conn:
-        return conn.execute(
+        rows = conn.execute(
             """SELECT u.id, u.username, u.display_name, u.email, u.is_active, u.created_at,
-                      COALESCE((SELECT SUM(best.points) FROM (
-                          SELECT MAX(COALESCE(a.earned_points, 0)) AS points
-                          FROM attempts a WHERE a.student_id = u.id GROUP BY a.question_id
-                      ) best), 0) AS score,
-                      COALESCE(ROUND(100.0 * COUNT(a.id) FILTER (WHERE a.earned_points > 0)
-                          / NULLIF(COUNT(a.id) FILTER (WHERE a.earned_points IS NOT NULL), 0)), 0) AS accuracy
+                      ROUND(100.0 * COUNT(a.id) FILTER (
+                          WHERE q.question_type IN ('choice', 'fill_blank')
+                            AND a.earned_points = q.points)
+                          / NULLIF(COUNT(a.id) FILTER (
+                              WHERE q.question_type IN ('choice', 'fill_blank')
+                                AND a.earned_points IS NOT NULL), 0)) AS accuracy
                FROM users u LEFT JOIN attempts a ON a.student_id = u.id
+               LEFT JOIN questions q ON q.id = a.question_id
                WHERE u.role = 'student'
-                 AND (%s = '' OR u.username ILIKE %s OR u.display_name ILIKE %s)
+                 AND (%s = '' OR u.username ILIKE %s OR u.display_name ILIKE %s
+                      OR u.email ILIKE %s)
                GROUP BY u.id ORDER BY u.username""",
-            (search, f"%{search}%", f"%{search}%"),
+            (search, f"%{search}%", f"%{search}%", f"%{search}%"),
         ).fetchall()
+        ranks = {row["id"]: row["rank"] for row in _leaderboard_rows(conn)}
+        students = []
+        for row in rows:
+            student = dict(row)
+            student["score"] = _student_score(conn, student["id"])
+            student["rank"] = ranks.get(student["id"])
+            students.append(student)
+        return students
+
+
+@app.get("/api/teacher/students/{student_id}")
+def teacher_student_detail(student_id: int, teacher=Depends(_require_teacher)):
+    with database() as conn:
+        student = conn.execute(
+            """SELECT u.id, u.username, u.display_name, u.email, u.is_active,
+                      u.created_at,
+                      COALESCE(ARRAY_AGG(c.name) FILTER (WHERE c.name IS NOT NULL), '{}')
+                          AS classes
+               FROM users u
+               LEFT JOIN class_memberships m ON m.student_id = u.id
+               LEFT JOIN classes c ON c.id = m.class_id
+               WHERE u.id = %s AND u.role = 'student'
+               GROUP BY u.id""",
+            (student_id,),
+        ).fetchone()
+        if not student:
+            raise HTTPException(status_code=404, detail="找不到學生帳號。")
+        accuracy = conn.execute(
+            """SELECT COUNT(*) AS answered,
+                      COUNT(*) FILTER (WHERE a.earned_points = q.points) AS correct
+               FROM attempts a JOIN questions q ON q.id = a.question_id
+               WHERE a.student_id = %s
+                 AND q.question_type IN ('choice', 'fill_blank')
+                 AND a.earned_points IS NOT NULL""",
+            (student_id,),
+        ).fetchone()
+        attempts = conn.execute(
+            """SELECT a.id, q.prompt, q.category, q.question_type, q.points,
+                      a.response, a.earned_points, a.feedback, a.submitted_at
+               FROM attempts a JOIN questions q ON q.id = a.question_id
+               WHERE a.student_id = %s ORDER BY a.submitted_at DESC LIMIT 100""",
+            (student_id,),
+        ).fetchall()
+        login_events = conn.execute(
+            """SELECT succeeded, created_at FROM login_events
+               WHERE user_id = %s ORDER BY created_at DESC LIMIT 20""",
+            (student_id,),
+        ).fetchall()
+        rankings = _leaderboard_rows(conn)
+        rank = next((row["rank"] for row in rankings if row["id"] == student_id), None)
+        score = _student_score(conn, student_id)
+    return {
+        **dict(student),
+        "score": score,
+        "rank": rank,
+        "accuracy": (
+            accuracy["correct"] * 100 / accuracy["answered"]
+            if accuracy["answered"] else None
+        ),
+        "attempts": attempts,
+        "login_history": login_events,
+    }
 
 
 @app.post("/api/teacher/students")
@@ -1044,6 +1112,38 @@ def create_student(payload: dict[str, Any], teacher=Depends(_require_teacher)):
     except psycopg.errors.UniqueViolation as exc:
         raise HTTPException(status_code=409, detail="帳號或電子郵件已被使用。") from exc
     return {"id": student["id"]}
+
+
+@app.patch("/api/teacher/students/{student_id}")
+def update_student(
+    student_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)
+):
+    display_name = str(payload.get("display_name", "")).strip()
+    email = str(payload.get("email", "")).strip().casefold()
+    if not 1 <= len(display_name) <= 40:
+        raise HTTPException(status_code=400, detail="暱稱需為 1 至 40 個字元。")
+    if email and (
+        len(email) > 254
+        or not re.fullmatch(r"[^@\s]+@[^@\s]+\.[^@\s]+", email)
+    ):
+        raise HTTPException(status_code=400, detail="電子郵件格式不正確。")
+    try:
+        with database() as conn:
+            with conn.transaction():
+                updated = conn.execute(
+                    """UPDATE users SET display_name = %s, email = %s
+                       WHERE id = %s AND role = 'student' RETURNING id""",
+                    (display_name, email, student_id),
+                ).fetchone()
+                if not updated:
+                    raise HTTPException(status_code=404, detail="找不到學生帳號。")
+                _audit(
+                    conn, teacher["id"], "update_student", "user", student_id,
+                    {"display_name": display_name, "email": email},
+                )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="此電子郵件已被其他學生使用。") from exc
+    return {"ok": True}
 
 
 @app.post("/api/teacher/students/{student_id}/reset-password")
@@ -1084,7 +1184,9 @@ def set_student_status(
 def teacher_classes(teacher=Depends(_require_teacher)):
     with database() as conn:
         return conn.execute(
-            """SELECT c.id, c.name, COUNT(m.student_id) AS student_count
+            """SELECT c.id, c.name, COUNT(m.student_id) AS student_count,
+                      COALESCE(ARRAY_AGG(m.student_id) FILTER (WHERE m.student_id IS NOT NULL), '{}')
+                          AS student_ids
                FROM classes c LEFT JOIN class_memberships m ON m.class_id = c.id
                WHERE c.teacher_id = %s GROUP BY c.id ORDER BY c.name""",
             (teacher["id"],),
@@ -1097,35 +1199,144 @@ def create_class(payload: dict[str, Any], teacher=Depends(_require_teacher)):
     ids = payload.get("student_ids", [])
     if not 1 <= len(name) <= 80 or not isinstance(ids, list):
         raise HTTPException(status_code=400, detail="班級名稱或學生清單無效。")
-    with database() as conn:
-        with conn.transaction():
-            class_row = conn.execute(
-                "INSERT INTO classes(teacher_id, name) VALUES (%s, %s) RETURNING id, name",
-                (teacher["id"], name),
-            ).fetchone()
-            for student_id in set(int(value) for value in ids):
-                valid = conn.execute(
-                    "SELECT 1 FROM users WHERE id = %s AND role = 'student' AND is_active",
-                    (student_id,),
+    try:
+        with database() as conn:
+            with conn.transaction():
+                class_row = conn.execute(
+                    "INSERT INTO classes(teacher_id, name) VALUES (%s, %s) RETURNING id, name",
+                    (teacher["id"], name),
                 ).fetchone()
-                if not valid:
-                    raise HTTPException(status_code=400, detail="學生清單包含無效帳號。")
-                conn.execute(
-                    "INSERT INTO class_memberships(class_id, student_id) VALUES (%s, %s)",
-                    (class_row["id"], student_id),
-                )
-            _audit(conn, teacher["id"], "create_class", "class", class_row["id"])
+                for student_id in set(int(value) for value in ids):
+                    valid = conn.execute(
+                        "SELECT 1 FROM users WHERE id = %s AND role = 'student' AND is_active",
+                        (student_id,),
+                    ).fetchone()
+                    if not valid:
+                        raise HTTPException(status_code=400, detail="學生清單包含無效帳號。")
+                    conn.execute(
+                        "INSERT INTO class_memberships(class_id, student_id) VALUES (%s, %s)",
+                        (class_row["id"], student_id),
+                    )
+                _audit(conn, teacher["id"], "create_class", "class", class_row["id"])
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="同名班級已存在。") from exc
     return class_row
 
 
+@app.patch("/api/teacher/classes/{class_id}")
+def update_class(class_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)):
+    name = str(payload.get("name", "")).strip()
+    student_ids = payload.get("student_ids", [])
+    if not 1 <= len(name) <= 80 or not isinstance(student_ids, list):
+        raise HTTPException(status_code=400, detail="班級名稱或學生清單無效。")
+    try:
+        ids = {int(value) for value in student_ids}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="學生清單包含無效帳號。") from exc
+    try:
+        with database() as conn:
+            with conn.transaction():
+                owned = conn.execute(
+                    "UPDATE classes SET name = %s WHERE id = %s AND teacher_id = %s RETURNING id",
+                    (name, class_id, teacher["id"]),
+                ).fetchone()
+                if not owned:
+                    raise HTTPException(status_code=404, detail="找不到可管理的班級。")
+                if ids:
+                    valid_count = conn.execute(
+                        """SELECT COUNT(*) AS count FROM users
+                           WHERE id = ANY(%s) AND role = 'student' AND is_active""",
+                        (list(ids),),
+                    ).fetchone()["count"]
+                    if valid_count != len(ids):
+                        raise HTTPException(status_code=400, detail="學生清單包含無效或停用帳號。")
+                conn.execute("DELETE FROM class_memberships WHERE class_id = %s", (class_id,))
+                conn.executemany(
+                    "INSERT INTO class_memberships(class_id, student_id) VALUES (%s, %s)",
+                    [(class_id, student_id) for student_id in ids],
+                )
+                _audit(
+                    conn, teacher["id"], "update_class", "class", class_id,
+                    {"name": name, "student_ids": sorted(ids)},
+                )
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="同名班級已存在。") from exc
+    return {"ok": True}
+
+
+@app.post("/api/teacher/banks")
+def create_question_bank(payload: dict[str, Any], teacher=Depends(_require_teacher)):
+    name = str(payload.get("name", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    if not 1 <= len(name) <= 100 or len(description) > 2000:
+        raise HTTPException(status_code=400, detail="題庫名稱需為 1 至 100 個字元，說明不可超過 2000 個字元。")
+    try:
+        with database() as conn:
+            with conn.transaction():
+                bank = conn.execute(
+                    """INSERT INTO question_banks(name, description, created_by)
+                       VALUES (%s, %s, %s) RETURNING id""",
+                    (name, description, teacher["id"]),
+                ).fetchone()
+                _audit(conn, teacher["id"], "create_question_bank", "question_bank", bank["id"])
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="同名題庫已存在。") from exc
+    return {"id": bank["id"]}
+
+
+@app.patch("/api/teacher/banks/{bank_id}")
+def update_question_bank(bank_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)):
+    name = str(payload.get("name", "")).strip()
+    description = str(payload.get("description", "")).strip()
+    if not 1 <= len(name) <= 100 or len(description) > 2000:
+        raise HTTPException(status_code=400, detail="題庫名稱需為 1 至 100 個字元，說明不可超過 2000 個字元。")
+    try:
+        with database() as conn:
+            with conn.transaction():
+                updated = conn.execute(
+                    """UPDATE question_banks SET name = %s, description = %s,
+                              updated_at = CURRENT_TIMESTAMP
+                       WHERE id = %s AND created_by = %s RETURNING id""",
+                    (name, description, bank_id, teacher["id"]),
+                ).fetchone()
+                if not updated:
+                    raise HTTPException(status_code=404, detail="找不到可管理的題庫。")
+                _audit(conn, teacher["id"], "update_question_bank", "question_bank", bank_id)
+    except psycopg.errors.UniqueViolation as exc:
+        raise HTTPException(status_code=409, detail="同名題庫已存在。") from exc
+    return {"ok": True}
+
+
+@app.delete("/api/teacher/banks/{bank_id}")
+def delete_question_bank(bank_id: int, teacher=Depends(_require_teacher)):
+    with database() as conn:
+        with conn.transaction():
+            bank = conn.execute(
+                "SELECT id FROM question_banks WHERE id = %s AND created_by = %s",
+                (bank_id, teacher["id"]),
+            ).fetchone()
+            if not bank:
+                raise HTTPException(status_code=404, detail="找不到可管理的題庫。")
+            count = conn.execute(
+                "SELECT COUNT(*) AS count FROM questions WHERE bank_id = %s",
+                (bank_id,),
+            ).fetchone()["count"]
+            if count:
+                raise HTTPException(status_code=409, detail="請先移動題庫中的題目，再刪除題庫。")
+            conn.execute("DELETE FROM question_banks WHERE id = %s", (bank_id,))
+            _audit(conn, teacher["id"], "delete_question_bank", "question_bank", bank_id)
+    return {"ok": True}
+
+
 @app.get("/api/teacher/questions", dependencies=[Depends(_require_teacher)])
-def teacher_questions(search: str = ""):
+def teacher_questions(search: str = "", bank_id: int | None = None):
     with database() as conn:
         rows = conn.execute(
             """SELECT * FROM questions
-               WHERE (%s = '' OR prompt ILIKE %s OR category ILIKE %s)
+               WHERE (%s = '' OR prompt ILIKE %s OR category ILIKE %s OR scope ILIKE %s)
+                 AND (%s IS NULL OR bank_id = %s)
                ORDER BY created_at DESC LIMIT 500""",
-            (search, f"%{search}%", f"%{search}%"),
+            (search, f"%{search}%", f"%{search}%", f"%{search}%", bank_id, bank_id),
         ).fetchall()
     return [_question_view(row, reveal=True) for row in rows]
 
@@ -1219,10 +1430,17 @@ def _validate_question(raw: dict[str, Any]) -> dict[str, Any]:
         min_word_count = int(raw.get("min_word_count", 0))
     except (TypeError, ValueError) as exc:
         raise HTTPException(status_code=400, detail="作文最低字數格式錯誤。") from exc
+    bank_id = raw.get("bank_id") or None
+    try:
+        bank_id = int(bank_id) if bank_id is not None else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="題庫格式無效。") from exc
+    if bank_id is not None and bank_id <= 0:
+        raise HTTPException(status_code=400, detail="題庫格式無效。")
     if not 0 <= min_word_count <= 100_000:
         raise HTTPException(status_code=400, detail="作文最低字數超出範圍。")
     return {
-        "bank_id": raw.get("bank_id"),
+        "bank_id": bank_id,
         "category": category,
         "scope": str(raw.get("scope", "")),
         "grade_level": str(raw.get("grade_level", "")),
@@ -1238,6 +1456,143 @@ def _validate_question(raw: dict[str, Any]) -> dict[str, Any]:
         "points": points,
         "is_published": bool(raw.get("is_published", True)),
     }
+
+
+def _parse_question_import_file(filename: str, content: bytes) -> Any:
+    suffix = filename.lower().rsplit(".", maxsplit=1)[-1] if "." in filename else ""
+    if suffix == "json":
+        try:
+            return json.loads(content.decode("utf-8-sig"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise HTTPException(status_code=400, detail="JSON 檔案格式或編碼無效。") from exc
+    if suffix == "csv":
+        try:
+            text = content.decode("utf-8-sig")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(status_code=400, detail="CSV 必須使用 UTF-8 編碼。") from exc
+        reader = csv.DictReader(io.StringIO(text))
+        rows = [
+            {str(key or "").strip(): value for key, value in row.items() if key}
+            for row in reader
+        ]
+        return {"questions": _normalize_tabular_questions(rows)}
+    if suffix != "xlsx":
+        raise HTTPException(status_code=400, detail="僅支援 JSON、CSV 或 XLSX 檔案。")
+
+    namespace = {"main": "http://schemas.openxmlformats.org/spreadsheetml/2006/main"}
+    try:
+        with zipfile.ZipFile(io.BytesIO(content)) as archive:
+            names = set(archive.namelist())
+            if sum(item.file_size for item in archive.infolist()) > 10_000_000:
+                raise HTTPException(status_code=413, detail="XLSX 解壓後內容超過安全上限。")
+            if "xl/worksheets/sheet1.xml" not in names:
+                raise HTTPException(status_code=400, detail="Excel 活頁簿找不到第一張工作表。")
+            shared_strings = []
+            if "xl/sharedStrings.xml" in names:
+                root = ET.fromstring(archive.read("xl/sharedStrings.xml"))
+                shared_strings = [
+                    "".join(node.text or "" for node in item.findall(".//main:t", namespace))
+                    for item in root.findall("main:si", namespace)
+                ]
+            sheet = ET.fromstring(archive.read("xl/worksheets/sheet1.xml"))
+    except HTTPException:
+        raise
+    except (zipfile.BadZipFile, ET.ParseError, KeyError) as exc:
+        raise HTTPException(status_code=400, detail="XLSX 活頁簿格式無效。") from exc
+
+    rows = []
+    for row in sheet.findall(".//main:sheetData/main:row", namespace):
+        values = []
+        for cell in row.findall("main:c", namespace):
+            column = "".join(char for char in cell.attrib.get("r", "") if char.isalpha())
+            column_index = 0
+            for char in column:
+                column_index = column_index * 26 + ord(char.upper()) - ord("A") + 1
+            if column_index == 0:
+                continue
+            while len(values) < column_index:
+                values.append("")
+            value_node = cell.find("main:v", namespace)
+            value = value_node.text if value_node is not None else ""
+            if cell.attrib.get("t") == "s" and value:
+                try:
+                    value = shared_strings[int(value)]
+                except (ValueError, IndexError) as exc:
+                    raise HTTPException(status_code=400, detail="XLSX 共用字串索引無效。") from exc
+            elif cell.attrib.get("t") == "inlineStr":
+                value = "".join(
+                    node.text or "" for node in cell.findall(".//main:t", namespace)
+                )
+            values[column_index - 1] = value
+        rows.append(values)
+    if not rows:
+        raise HTTPException(status_code=400, detail="Excel 工作表沒有內容。")
+    headings = [str(value).strip() for value in rows[0]]
+    records = [
+        dict(zip(headings, row + [""] * max(0, len(headings) - len(row))))
+        for row in rows[1:]
+        if any(str(value).strip() for value in row)
+    ]
+    return {"questions": _normalize_tabular_questions(records)}
+
+
+def _normalize_tabular_questions(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    questions = []
+    for row in rows:
+        question = dict(row)
+        question["options"] = [
+            value.strip()
+            for value in str(row.get("options", "")).split("|")
+            if value.strip()
+        ]
+        question["accepted_answers"] = [
+            value.strip()
+            for value in str(row.get("accepted_answers", "")).split("|")
+            if value.strip()
+        ] or ([str(row.get("answer", "")).strip()] if row.get("answer") else [])
+        for field, default in (("points", 5), ("min_word_count", 0)):
+            value = str(row.get(field, "")).strip()
+            question[field] = int(value) if value.isdigit() else default if not value else value
+        questions.append(question)
+    return questions
+
+
+def _prepare_question_import(payload: Any, selected_bank_id=None):
+    data = payload.get("questions", payload) if isinstance(payload, dict) else payload
+    if isinstance(data, dict):
+        data = data.get("questions")
+    if not isinstance(data, list) or not 1 <= len(data) <= 500:
+        raise HTTPException(status_code=400, detail="匯入內容需包含 1 至 500 題。")
+    try:
+        encoded = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="匯入內容無法解析。") from exc
+    if len(encoded) > 2_000_000:
+        raise HTTPException(status_code=413, detail="題目匯入內容上限為 2 MB。")
+
+    inherited_category = payload.get("category") if isinstance(payload, dict) else None
+    inherited_level = payload.get("level") if isinstance(payload, dict) else None
+    validated = []
+    errors = []
+    for index, item in enumerate(data, 1):
+        if not isinstance(item, dict):
+            errors.append(f"第 {index} 題：題目資料必須是物件。")
+            continue
+        normalized = dict(item)
+        normalized.setdefault("category", inherited_category or "General")
+        if not normalized.get("difficulty"):
+            normalized["difficulty"] = inherited_level or "中級"
+        if selected_bank_id is not None:
+            normalized["bank_id"] = selected_bank_id
+        try:
+            validated.append(_validate_question(normalized))
+        except HTTPException as exc:
+            errors.append(f"第 {index} 題：{exc.detail}")
+    if errors:
+        raise HTTPException(status_code=400, detail={"message": "題目驗證失敗。", "errors": errors})
+    title = str(payload.get("title", "")).strip() if isinstance(payload, dict) else ""
+    canonical = json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
+    return validated, title, hashlib.sha256(canonical).hexdigest()
 
 
 def _insert_question(conn, teacher_id, question):
@@ -1275,26 +1630,10 @@ def add_teacher_question(payload: dict[str, Any], teacher=Depends(_require_teach
 
 @app.post("/api/teacher/questions/import")
 def import_questions(payload: Any, teacher=Depends(_require_teacher)):
-    data = payload.get("questions", payload) if isinstance(payload, dict) else payload
-    if isinstance(data, dict):
-        data = data.get("questions")
-    if not isinstance(data, list) or not 1 <= len(data) <= 500:
-        raise HTTPException(status_code=400, detail="匯入內容需包含 1 至 500 題。")
-    inherited_category = payload.get("category") if isinstance(payload, dict) else None
-    inherited_level = payload.get("level") if isinstance(payload, dict) else None
-    validated = []
-    for item in data:
-        normalized = dict(item)
-        normalized.setdefault("category", inherited_category or "General")
-        if not normalized.get("difficulty"):
-            normalized["difficulty"] = inherited_level or "中級"
-        validated.append(_validate_question(normalized))
-    title = str(payload.get("title", "")).strip() if isinstance(payload, dict) else ""
-    content_hash = hashlib.sha256(
-        json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")
-    ).hexdigest()
-    if len(json.dumps(payload, ensure_ascii=False).encode("utf-8")) > 2_000_000:
-        raise HTTPException(status_code=413, detail="題目匯入內容上限為 2 MB。")
+    selected_bank_id = payload.get("bank_id") if isinstance(payload, dict) else None
+    validated, title, content_hash = _prepare_question_import(
+        payload, selected_bank_id
+    )
     with database() as conn:
         with conn.transaction():
             duplicate = conn.execute(
@@ -1302,14 +1641,16 @@ def import_questions(payload: Any, teacher=Depends(_require_teacher)):
             ).fetchone()
             if duplicate:
                 raise HTTPException(status_code=409, detail="此份考卷已匯入過，避免重複建立。")
-            bank_id = payload.get("bank_id") if isinstance(payload, dict) else None
+            bank_id = selected_bank_id
             if not bank_id and title:
                 bank = conn.execute(
                     """INSERT INTO question_banks(name, created_by)
                        VALUES (%s, %s) ON CONFLICT(name) DO UPDATE SET updated_at = CURRENT_TIMESTAMP
-                       RETURNING id""",
+                       RETURNING id, created_by""",
                     (title[:120], teacher["id"]),
                 ).fetchone()
+                if bank["created_by"] != teacher["id"]:
+                    raise HTTPException(status_code=409, detail="同名題庫已由其他教師建立，請選擇自己的題庫。")
                 bank_id = bank["id"]
             ids = []
             for question in validated:
@@ -1322,6 +1663,43 @@ def import_questions(payload: Any, teacher=Depends(_require_teacher)):
             )
             _audit(conn, teacher["id"], "import_questions", "question_bank", bank_id or "", {"count": len(ids)})
     return {"imported": len(ids), "question_ids": ids, "bank_id": bank_id}
+
+
+@app.post("/api/teacher/questions/import-preview")
+def preview_question_import(payload: dict[str, Any], teacher=Depends(_require_teacher)):
+    filename = str(payload.get("filename", ""))
+    encoded = str(payload.get("content_base64", ""))
+    if not filename or not encoded or len(encoded) > 2_800_000:
+        raise HTTPException(status_code=413, detail="匯入檔案不可超過 2 MB。")
+    try:
+        content = b64decode(encoded, validate=True)
+    except Base64Error as exc:
+        raise HTTPException(status_code=400, detail="檔案上傳資料格式無效。") from exc
+    if len(content) > 2_000_000:
+        raise HTTPException(status_code=413, detail="匯入檔案不可超過 2 MB。")
+    parsed = _parse_question_import_file(filename, content)
+    selected_bank_id = payload.get("bank_id") or None
+    validated, title, _ = _prepare_question_import(parsed, selected_bank_id)
+    return {
+        "payload": {
+            **(parsed if isinstance(parsed, dict) else {}),
+            "title": title,
+            "bank_id": selected_bank_id,
+            "questions": validated,
+        },
+        "questions": [
+            {
+                "category": question["category"],
+                "scope": question["scope"],
+                "grade_level": question["grade_level"],
+                "difficulty": question["difficulty"],
+                "type": question["question_type"],
+                "prompt": question["prompt"],
+                "points": question["points"],
+            }
+            for question in validated
+        ],
+    }
 
 
 @app.patch("/api/teacher/questions/{question_id}")
@@ -1400,30 +1778,61 @@ def teacher_banks(teacher=Depends(_require_teacher)):
         ).fetchall()
 
 
+
 @app.post("/api/teacher/assignments")
 def create_assignment(payload: dict[str, Any], teacher=Depends(_require_teacher)):
     title = str(payload.get("title", "")).strip()
     question_ids = payload.get("question_ids", [])
     student_ids = payload.get("student_ids", [])
-    if not title or not question_ids or not student_ids:
+    if (
+        not 1 <= len(title) <= 160
+        or not isinstance(question_ids, list)
+        or not question_ids
+        or not isinstance(student_ids, list)
+        or not student_ids
+    ):
         raise HTTPException(status_code=400, detail="作業名稱、題目與學生皆為必填。")
+    status = str(payload.get("status", "published"))
+    if status not in {"draft", "published", "closed"}:
+        raise HTTPException(status_code=400, detail="作業狀態無效。")
+    try:
+        start_value = datetime.fromisoformat(payload["starts_at"]) if payload.get("starts_at") else None
+        due_value = datetime.fromisoformat(payload["due_at"]) if payload.get("due_at") else None
+        time_limit = int(payload.get("time_limit_minutes", 0))
+        question_ids = {int(value) for value in question_ids}
+        student_ids = {int(value) for value in student_ids}
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="作業時間、題目或學生清單格式無效。") from exc
+    if start_value and due_value and start_value >= due_value:
+        raise HTTPException(status_code=400, detail="截止時間必須晚於開始時間。")
+    if not 0 <= time_limit <= 600:
+        raise HTTPException(status_code=400, detail="作答時間限制需介於 0 至 600 分鐘。")
     with database() as conn:
         with conn.transaction():
+            valid_questions = conn.execute(
+                """SELECT COUNT(*) AS count FROM questions
+                   WHERE id = ANY(%s) AND (created_by = %s OR created_by IS NULL)""",
+                (list(question_ids), teacher["id"]),
+            ).fetchone()["count"]
+            if valid_questions != len(question_ids):
+                raise HTTPException(status_code=400, detail="題目清單包含無效或無權管理的題目。")
             assignment = conn.execute(
                 """INSERT INTO assignment_sets
-                   (teacher_id, title, description, due_at, time_limit_minutes,
+                   (teacher_id, title, description, starts_at, due_at, time_limit_minutes,
                     allow_retake, show_answers, status)
-                   VALUES (%s, %s, %s, %s, %s, %s, %s, 'published') RETURNING id""",
+                   VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id""",
                 (teacher["id"], title, str(payload.get("description", ""))[:2000],
-                 payload.get("due_at"), max(0, int(payload.get("time_limit_minutes", 0))),
-                 bool(payload.get("allow_retake", False)), bool(payload.get("show_answers", True))),
+                 payload.get("starts_at"), payload.get("due_at"),
+                 time_limit,
+                 bool(payload.get("allow_retake", False)),
+                 bool(payload.get("show_answers", True)), status),
             ).fetchone()
-            for question_id in set(int(value) for value in question_ids):
+            for question_id in question_ids:
                 conn.execute(
                     "INSERT INTO assignment_questions(assignment_id, question_id) VALUES (%s, %s)",
                     (assignment["id"], question_id),
                 )
-            for student_id in set(int(value) for value in student_ids):
+            for student_id in student_ids:
                 valid = conn.execute(
                     "SELECT 1 FROM users WHERE id = %s AND role = 'student' AND is_active",
                     (student_id,),
@@ -1438,19 +1847,288 @@ def create_assignment(payload: dict[str, Any], teacher=Depends(_require_teacher)
     return {"id": assignment["id"]}
 
 
+@app.patch("/api/teacher/assignments/{assignment_id}/schedule")
+def update_assignment_schedule(
+    assignment_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)
+):
+    starts_at = payload.get("starts_at") or None
+    due_at = payload.get("due_at") or None
+    try:
+        start_value = datetime.fromisoformat(starts_at) if starts_at else None
+        due_value = datetime.fromisoformat(due_at) if due_at else None
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="作業開始或截止時間格式無效。") from exc
+    if start_value and due_value and start_value >= due_value:
+        raise HTTPException(status_code=400, detail="截止時間必須晚於開始時間。")
+    with database() as conn:
+        with conn.transaction():
+            updated = conn.execute(
+                """UPDATE assignment_sets SET starts_at = %s, due_at = %s
+                   WHERE id = %s AND teacher_id = %s RETURNING id""",
+                (starts_at, due_at, assignment_id, teacher["id"]),
+            ).fetchone()
+            if not updated:
+                raise HTTPException(status_code=404, detail="找不到可管理的作業。")
+            _audit(
+                conn, teacher["id"], "update_assignment_schedule", "assignment",
+                assignment_id, {"starts_at": starts_at, "due_at": due_at},
+            )
+    return {"ok": True}
+
+
+@app.patch("/api/teacher/assignments/{assignment_id}/status")
+def update_assignment_status(
+    assignment_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)
+):
+    status = str(payload.get("status", ""))
+    if status not in {"draft", "published", "closed"}:
+        raise HTTPException(status_code=400, detail="作業狀態無效。")
+    with database() as conn:
+        with conn.transaction():
+            updated = conn.execute(
+                """UPDATE assignment_sets SET status = %s
+                   WHERE id = %s AND teacher_id = %s RETURNING id""",
+                (status, assignment_id, teacher["id"]),
+            ).fetchone()
+            if not updated:
+                raise HTTPException(status_code=404, detail="找不到可管理的作業。")
+            _audit(
+                conn, teacher["id"], "update_assignment_status", "assignment",
+                assignment_id, {"status": status},
+            )
+    return {"ok": True}
+
+
 @app.get("/api/teacher/assignments")
 def teacher_assignments(teacher=Depends(_require_teacher)):
     with database() as conn:
         return conn.execute(
-            """SELECT a.id, a.title, a.description, a.due_at, a.status,
+            """SELECT a.id, a.title, a.description, a.starts_at, a.due_at, a.status,
+                      a.time_limit_minutes, a.allow_retake, a.show_answers,
                       COUNT(DISTINCT s.student_id) AS student_count,
-                      COUNT(DISTINCT t.student_id) AS submitted_students
+                      COUNT(DISTINCT CASE WHEN t.quiz_id IS NOT NULL
+                          THEN t.student_id END) AS submitted_students,
+                      COUNT(DISTINCT q.question_id) AS question_count,
+                      (SELECT AVG(z.score * 1.0 / NULLIF(z.max_score, 0))
+                       FROM quiz_sessions z WHERE z.assignment_id = a.id
+                         AND z.status = 'submitted') AS average_ratio
                FROM assignment_sets a
                LEFT JOIN assignment_students s ON s.assignment_id = a.id
+               LEFT JOIN assignment_questions q ON q.assignment_id = a.id
                LEFT JOIN attempts t ON t.assignment_id = a.id
                WHERE a.teacher_id = %s GROUP BY a.id ORDER BY a.created_at DESC""",
             (teacher["id"],),
         ).fetchall()
+
+
+@app.get("/api/teacher/assignments/{assignment_id}/statistics")
+def assignment_statistics(assignment_id: int, teacher=Depends(_require_teacher)):
+    with database() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM assignment_sets WHERE id = %s AND teacher_id = %s",
+            (assignment_id, teacher["id"]),
+        ).fetchone()
+        if not owned:
+            raise HTTPException(status_code=404, detail="找不到可管理的作業。")
+        question_rows = conn.execute(
+            """SELECT q.id AS question_id, q.prompt, q.points, q.question_type,
+                      COUNT(DISTINCT a.student_id) AS response_count,
+                      COUNT(DISTINCT CASE
+                          WHEN q.question_type IN ('choice', 'fill_blank')
+                           AND a.earned_points = q.points THEN a.student_id END)
+                          AS correct_count
+               FROM assignment_questions aq
+               JOIN questions q ON q.id = aq.question_id
+               LEFT JOIN attempts a ON a.assignment_id = aq.assignment_id
+                                   AND a.question_id = q.id
+               WHERE aq.assignment_id = %s
+               GROUP BY q.id ORDER BY q.id""",
+            (assignment_id,),
+        ).fetchall()
+        submissions = conn.execute(
+            """SELECT u.id AS student_id,
+                      (SELECT COUNT(DISTINCT a.question_id) FROM attempts a
+                       WHERE a.assignment_id = s.assignment_id
+                         AND a.student_id = s.student_id) AS answered_count,
+                      COALESCE((SELECT SUM(best.score) FROM (
+                          SELECT MAX(a.earned_points) AS score FROM attempts a
+                          WHERE a.assignment_id = s.assignment_id
+                            AND a.student_id = s.student_id
+                            AND a.earned_points IS NOT NULL
+                          GROUP BY a.question_id
+                      ) best), 0) AS score,
+                      COALESCE((SELECT SUM(q.points) FROM assignment_questions aq
+                                JOIN questions q ON q.id = aq.question_id
+                                WHERE aq.assignment_id = s.assignment_id), 0) AS max_score,
+                      (SELECT MAX(a.submitted_at) FROM attempts a
+                       WHERE a.assignment_id = s.assignment_id
+                         AND a.student_id = s.student_id) AS submitted_at
+               FROM assignment_students s JOIN users u ON u.id = s.student_id
+               WHERE s.assignment_id = %s ORDER BY u.display_name""",
+            (assignment_id,),
+        ).fetchall()
+    completed_scores = [
+        row["score"] for row in submissions if row["submitted_at"] is not None
+    ]
+    for question in question_rows:
+        question["correct_rate"] = (
+            question["correct_count"] / question["response_count"]
+            if question["response_count"]
+            and question["question_type"] in {"choice", "fill_blank"}
+            else None
+        )
+    return {
+        "submission_count": len(completed_scores),
+        "average_score": (
+            sum(completed_scores) / len(completed_scores) if completed_scores else None
+        ),
+        "highest_score": max(completed_scores) if completed_scores else None,
+        "lowest_score": min(completed_scores) if completed_scores else None,
+        "questions": question_rows,
+    }
+
+
+@app.get("/api/teacher/assignments/{assignment_id}/submissions")
+def assignment_submissions(assignment_id: int, teacher=Depends(_require_teacher)):
+    with database() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM assignment_sets WHERE id = %s AND teacher_id = %s",
+            (assignment_id, teacher["id"]),
+        ).fetchone()
+        if not owned:
+            raise HTTPException(status_code=404, detail="找不到可管理的作業。")
+        return conn.execute(
+            """SELECT u.id AS student_id, u.username, u.display_name,
+                      (SELECT COUNT(DISTINCT a.question_id) FROM attempts a
+                       WHERE a.assignment_id = s.assignment_id
+                         AND a.student_id = s.student_id) AS answered_count,
+                      COALESCE((SELECT SUM(best.score) FROM (
+                          SELECT MAX(a.earned_points) AS score FROM attempts a
+                          WHERE a.assignment_id = s.assignment_id
+                            AND a.student_id = s.student_id
+                            AND a.earned_points IS NOT NULL
+                          GROUP BY a.question_id
+                      ) best), 0) AS score,
+                      COALESCE((SELECT SUM(q.points) FROM assignment_questions aq
+                                JOIN questions q ON q.id = aq.question_id
+                                WHERE aq.assignment_id = s.assignment_id), 0) AS max_score,
+                      (SELECT MAX(a.submitted_at) FROM attempts a
+                       WHERE a.assignment_id = s.assignment_id
+                         AND a.student_id = s.student_id) AS submitted_at
+               FROM assignment_students s JOIN users u ON u.id = s.student_id
+               WHERE s.assignment_id = %s ORDER BY u.display_name""",
+            (assignment_id,),
+        ).fetchall()
+
+
+@app.get("/api/teacher/assignments/{assignment_id}/students/{student_id}/attempts")
+def assignment_student_attempts(
+    assignment_id: int, student_id: int, teacher=Depends(_require_teacher)
+):
+    with database() as conn:
+        permitted = conn.execute(
+            """SELECT 1 FROM assignment_students s
+               JOIN assignment_sets a ON a.id = s.assignment_id
+               WHERE s.assignment_id = %s AND s.student_id = %s AND a.teacher_id = %s""",
+            (assignment_id, student_id, teacher["id"]),
+        ).fetchone()
+        if not permitted:
+            raise HTTPException(status_code=404, detail="找不到此作業中的學生。")
+        return conn.execute(
+            """SELECT q.id AS question_id, latest.id AS attempt_id, q.prompt, q.points,
+                      q.answer, q.accepted_answers, q.question_type,
+                      latest.response, latest.earned_points, latest.feedback,
+                      latest.submitted_at
+               FROM assignment_questions aq
+               JOIN questions q ON q.id = aq.question_id
+               LEFT JOIN LATERAL (
+                   SELECT a.id, a.response, a.earned_points, a.feedback, a.submitted_at
+                   FROM attempts a
+                   WHERE a.assignment_id = aq.assignment_id
+                     AND a.student_id = %s AND a.question_id = aq.question_id
+                   ORDER BY a.id DESC LIMIT 1
+               ) latest ON TRUE
+               WHERE aq.assignment_id = %s ORDER BY q.id""",
+            (student_id, assignment_id),
+        ).fetchall()
+
+
+@app.post("/api/teacher/attempts/{attempt_id}/adjust-score")
+def adjust_attempt_score(
+    attempt_id: int, payload: dict[str, Any], teacher=Depends(_require_teacher)
+):
+    score = payload.get("score")
+    reason = str(payload.get("reason", "")).strip()
+    if isinstance(score, bool) or not isinstance(score, int):
+        raise HTTPException(status_code=400, detail="分數必須是整數。")
+    if not 1 <= len(reason) <= 500:
+        raise HTTPException(status_code=400, detail="請填寫 1 至 500 個字元的評分調整原因。")
+    with database() as conn:
+        with conn.transaction():
+            attempt = conn.execute(
+                """SELECT a.id, a.quiz_id, a.earned_points, q.points
+                   FROM attempts a JOIN questions q ON q.id = a.question_id
+                   JOIN assignment_sets s ON s.id = a.assignment_id
+                   WHERE a.id = %s AND s.teacher_id = %s FOR UPDATE OF a""",
+                (attempt_id, teacher["id"]),
+            ).fetchone()
+            if not attempt:
+                raise HTTPException(status_code=404, detail="找不到此教師作業的作答紀錄。")
+            if not 0 <= score <= attempt["points"]:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"分數需介於 0 至 {attempt['points']}。",
+                )
+            conn.execute(
+                "UPDATE attempts SET earned_points = %s WHERE id = %s",
+                (score, attempt_id),
+            )
+            if attempt["quiz_id"]:
+                conn.execute(
+                    """UPDATE quiz_sessions SET score = (
+                           SELECT COALESCE(SUM(earned_points), 0)
+                           FROM attempts WHERE quiz_id = %s
+                       ) WHERE id = %s""",
+                    (attempt["quiz_id"], attempt["quiz_id"]),
+                )
+            _audit(
+                conn, teacher["id"], "adjust_attempt_score", "attempt", attempt_id,
+                {"old_score": attempt["earned_points"], "new_score": score, "reason": reason},
+            )
+    return {"ok": True}
+
+
+@app.get("/api/teacher/assignments/{assignment_id}/scores.csv")
+def export_assignment_scores(assignment_id: int, teacher=Depends(_require_teacher)):
+    with database() as conn:
+        owned = conn.execute(
+            "SELECT 1 FROM assignment_sets WHERE id = %s AND teacher_id = %s",
+            (assignment_id, teacher["id"]),
+        ).fetchone()
+        if not owned:
+            raise HTTPException(status_code=404, detail="找不到可管理的作業。")
+    students = assignment_submissions(assignment_id, teacher)
+    output = io.StringIO(newline="")
+    writer = csv.DictWriter(
+        output,
+        fieldnames=[
+            "student_id", "username", "display_name", "answered_count",
+            "score", "max_score", "submitted_at",
+        ],
+    )
+    writer.writeheader()
+    for row in students:
+        safe_row = dict(row)
+        for field in ("username", "display_name"):
+            value = str(safe_row[field] or "")
+            if value.startswith(("=", "+", "-", "@", "\t", "\r")):
+                safe_row[field] = "'" + value
+        writer.writerow(safe_row)
+    return Response(
+        content="\ufeff" + output.getvalue(),
+        media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="ccss-assignment-{assignment_id}-scores.csv"'},
+    )
 
 
 @app.get("/api/teacher/essays")
